@@ -72,13 +72,23 @@ Tell the user:
 
 > You need a Google Cloud OAuth client. This is a one-time setup:
 >
-> 1. Go to https://console.cloud.google.com/apis/credentials
-> 2. Create a project (or use an existing one)
-> 3. Click "Enable APIs" and enable: Gmail API, Google Calendar API,
->    Google Drive API, Google Sheets API, Google Docs API, People API
-> 4. Go to Credentials → Create Credentials → OAuth 2.0 Client ID
-> 5. Application type: "Desktop app" → Create
-> 6. Click "Download JSON" and tell me the file path
+> 1. Create or select a project:
+>    https://console.cloud.google.com/projectselector2/home/dashboard
+> 2. Enable the required APIs from the API Library:
+>    https://console.cloud.google.com/apis/library
+>    Enable: Gmail API, Google Calendar API, Google Drive API,
+>    Google Sheets API, Google Docs API, People API
+> 3. Create the OAuth client here:
+>    https://console.cloud.google.com/apis/credentials
+>    Credentials → Create Credentials → OAuth 2.0 Client ID
+> 4. Application type: "Desktop app" → Create
+> 5. If the app is still in Testing, add the user's Google account as a test user here:
+>    https://console.cloud.google.com/auth/audience
+>    Audience → Test users → Add users
+> 6. Download the JSON file and tell me the file path
+>
+> Important Hermes CLI note: if the file path starts with `/`, do NOT send only the bare path as its own message in the CLI, because it can be mistaken for a slash command. Send it in a sentence instead, like:
+> `The JSON file path is: /home/user/Downloads/client_secret_....json`
 
 Once they provide the path:
 
