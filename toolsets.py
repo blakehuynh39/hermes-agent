@@ -452,6 +452,28 @@ def resolve_toolset(name: str, visited: Set[str] = None) -> List[str]:
                 return [e.name for e in registry._tools.values() if e.toolset == name]
             except Exception:
                 pass
+
+        # Auto-generate a toolset for plugin platforms (hermes-<name>).
+        # Gives them _HERMES_CORE_TOOLS plus any tools the plugin registered
+        # into a toolset matching the platform name.
+        if name.startswith("hermes-"):
+            platform_name = name[len("hermes-"):]
+            try:
+                from gateway.platform_registry import platform_registry
+                if platform_registry.is_registered(platform_name):
+                    plugin_tools = set(_HERMES_CORE_TOOLS)
+                    try:
+                        from tools.registry import registry
+                        plugin_tools.update(
+                            e.name for e in registry._tools.values()
+                            if e.toolset == platform_name
+                        )
+                    except Exception:
+                        pass
+                    return list(plugin_tools)
+            except Exception:
+                pass
+
         return []
 
     # Collect direct tools
