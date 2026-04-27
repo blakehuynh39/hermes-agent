@@ -76,6 +76,11 @@ describe('fromSkin', () => {
     expect(brand.prompt).toBe('$')
   })
 
+  it('normalizes skin prompt symbols to one trimmed line', () => {
+    expect(fromSkin({}, { prompt_symbol: ' ⚔ ❯ \n' }).brand.prompt).toBe('⚔ ❯')
+    expect(fromSkin({}, { prompt_symbol: '\n\t' }).brand.prompt).toBe(DEFAULT_THEME.brand.prompt)
+  })
+
   it('defaults for empty skin', () => {
     expect(fromSkin({}, {}).color).toEqual(DEFAULT_THEME.color)
     expect(fromSkin({}, {}).brand.icon).toBe(DEFAULT_THEME.brand.icon)

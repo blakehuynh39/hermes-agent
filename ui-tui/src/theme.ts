@@ -88,6 +88,14 @@ const BRAND: ThemeBrand = {
   helpHeader: '(^_^)? Commands'
 }
 
+const cleanPromptSymbol = (s: string | undefined, fallback: string) => {
+  const cleaned = String(s ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  return cleaned || fallback
+}
+
 export const DARK_THEME: Theme = {
   color: {
     primary: '#FFD700',
@@ -254,7 +262,7 @@ export function fromSkin(
     brand: {
       name: branding.agent_name ?? d.brand.name,
       icon: d.brand.icon,
-      prompt: branding.prompt_symbol ?? d.brand.prompt,
+      prompt: cleanPromptSymbol(branding.prompt_symbol, d.brand.prompt),
       welcome: branding.welcome ?? d.brand.welcome,
       goodbye: branding.goodbye ?? d.brand.goodbye,
       tool: toolPrefix || d.brand.tool,
