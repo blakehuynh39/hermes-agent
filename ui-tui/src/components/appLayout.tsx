@@ -183,13 +183,13 @@ const ComposerPane = memo(function ComposerPane({
       />
 
       {ui.bgTasks.size > 0 && (
-        <Text color={ui.theme.color.dim}>
+        <Text color={ui.theme.color.muted}>
           {ui.bgTasks.size} background {ui.bgTasks.size === 1 ? 'task' : 'tasks'} running
         </Text>
       )}
 
       {status.showStickyPrompt ? (
-        <Text color={ui.theme.color.dim} wrap="truncate-end">
+        <Text color={ui.theme.color.muted} wrap="truncate-end">
           <Text color={ui.theme.color.label}>↳ </Text>
 
           {status.stickyPrompt}
@@ -214,8 +214,13 @@ const ComposerPane = memo(function ComposerPane({
           <>
             {composer.inputBuf.map((line, i) => (
               <Box key={i}>
+<<<<<<< HEAD
                 <Box width={2}>
                   <Text color={ui.theme.color.dim}>{i === 0 ? `${ui.theme.brand.prompt} ` : '  '}</Text>
+=======
+                <Box width={3}>
+                  <Text color={ui.theme.color.muted}>{i === 0 ? `${ui.theme.brand.prompt} ` : '  '}</Text>
+>>>>>>> 10feb682b (refactor(tui): migrate components to semantic theme tokens)
                 </Box>
 
                 <Text color={ui.theme.color.text}>{line || ' '}</Text>
@@ -254,7 +259,7 @@ const ComposerPane = memo(function ComposerPane({
         )}
       </Box>
 
-      {!composer.empty && !ui.sid && <Text color={ui.theme.color.dim}>⚕ {ui.status}</Text>}
+      {!composer.empty && !ui.sid && <Text color={ui.theme.color.muted}>⚕ {ui.status}</Text>}
 
       <StatusRulePane at="bottom" composer={composer} status={status} />
     </NoSelect>

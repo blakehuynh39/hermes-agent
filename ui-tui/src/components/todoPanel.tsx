@@ -9,7 +9,7 @@ import type { TodoItem } from '../types.js'
 const rowColor = (t: Theme, status: TodoItem['status']) => {
   const tone = todoTone(status)
 
-  return tone === 'active' ? t.color.text : tone === 'body' ? t.color.statusFg : t.color.dim
+  return tone === 'active' ? t.color.text : tone === 'body' ? t.color.statusFg : t.color.muted
 }
 
 export const TodoPanel = memo(function TodoPanel({
@@ -56,8 +56,8 @@ export const TodoPanel = memo(function TodoPanel({
   return (
     <Box flexDirection="column" marginBottom={1}>
       <Box onClick={handleToggle}>
-        <Text color={t.color.dim}>
-          <Text color={t.color.amber}>{effectiveCollapsed ? '▸ ' : '▾ '}</Text>
+        <Text color={t.color.muted}>
+          <Text color={t.color.accent}>{effectiveCollapsed ? '▸ ' : '▾ '}</Text>
           <Text bold color={t.color.text}>
             Todo
           </Text>{' '}
@@ -65,7 +65,7 @@ export const TodoPanel = memo(function TodoPanel({
             ({done}/{todos.length})
           </Text>
           {incomplete && pending > 0 && (
-            <Text color={t.color.dim} dim>
+            <Text color={t.color.muted} dim>
               {' '}
               · incomplete · {pending} still {pending === 1 ? 'pending' : 'pending/in_progress'}
             </Text>

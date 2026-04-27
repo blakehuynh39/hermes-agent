@@ -107,7 +107,7 @@ export function LearningLedger({ gw, onClose, t }: LearningLedgerProps) {
   })
 
   if (loading) {
-    return <Text color={t.color.dim}>indexing learning ledger…</Text>
+    return <Text color={t.color.muted}>indexing learning ledger…</Text>
   }
 
   if (err) {
@@ -122,12 +122,12 @@ export function LearningLedger({ gw, onClose, t }: LearningLedgerProps) {
   if (!items.length) {
     return (
       <Box flexDirection="column" width={width}>
-        <Text bold color={t.color.amber}>
+        <Text bold color={t.color.accent}>
           Recent Learning
         </Text>
-        <Text color={t.color.dim}>no memories, recalls, used skills, or integrations found yet</Text>
+        <Text color={t.color.muted}>no memories, recalls, used skills, or integrations found yet</Text>
         {ledger?.inventory?.skills ? (
-          <Text color={t.color.dim}>available knowledge: {ledger.inventory.skills} installed skills</Text>
+          <Text color={t.color.muted}>available knowledge: {ledger.inventory.skills} installed skills</Text>
         ) : null}
         <OverlayHint t={t}>Esc/q close</OverlayHint>
       </Box>
@@ -138,16 +138,16 @@ export function LearningLedger({ gw, onClose, t }: LearningLedgerProps) {
 
   return (
     <Box flexDirection="column" width={width}>
-      <Text bold color={t.color.amber}>
+      <Text bold color={t.color.accent}>
         Recent Learning
       </Text>
-      <Text color={t.color.dim}>
+      <Text color={t.color.muted}>
         {ledger?.total ?? items.length} traces{counts ? ` · ${counts}` : ''}
       </Text>
       {ledger?.inventory?.skills ? (
-        <Text color={t.color.dim}>available knowledge: {ledger.inventory.skills} installed skills</Text>
+        <Text color={t.color.muted}>available knowledge: {ledger.inventory.skills} installed skills</Text>
       ) : null}
-      {offset > 0 && <Text color={t.color.dim}> ↑ {offset} more</Text>}
+      {offset > 0 && <Text color={t.color.muted}> ↑ {offset} more</Text>}
 
       <Box flexDirection="row" gap={1} width={width}>
         <Box flexDirection="column" width={listWidth}>
@@ -172,7 +172,7 @@ export function LearningLedger({ gw, onClose, t }: LearningLedgerProps) {
       </Box>
 
       {offset + VISIBLE_ROWS < items.length && (
-        <Text color={t.color.dim}> ↓ {items.length - offset - VISIBLE_ROWS} more</Text>
+        <Text color={t.color.muted}> ↓ {items.length - offset - VISIBLE_ROWS} more</Text>
       )}
 
       <OverlayHint t={t}>↑/↓ select · Enter/Space details · 1-9,0 quick · Esc/q close</OverlayHint>
@@ -189,10 +189,10 @@ function LedgerRow({ active, index, item, t, width }: LedgerRowProps) {
 
   return (
     <Box width={width}>
-      <Text bold={active} color={active ? t.color.amber : t.color.dim} inverse={active} wrap="truncate-end">
+      <Text bold={active} color={active ? t.color.accent : t.color.muted} inverse={active} wrap="truncate-end">
         {active ? '▸ ' : '  '}
         {index}. {icon} {verb}: {title}
-        <Text color={active ? t.color.amber : t.color.dim}>
+        <Text color={active ? t.color.accent : t.color.muted}>
           {' '}
           {count}
           {when ? ` · ${when}` : ''}
@@ -206,19 +206,19 @@ function LedgerDetails({ item, t, width }: LedgerDetailsProps) {
   const memoryLike = item.type === 'memory' || item.type === 'user'
 
   return (
-    <Box borderColor={t.color.dim} borderStyle="single" flexDirection="column" paddingX={1} width={width}>
-      <Text bold color={t.color.amber}>
+    <Box borderColor={t.color.muted} borderStyle="single" flexDirection="column" paddingX={1} width={width}>
+      <Text bold color={t.color.accent}>
         Details
       </Text>
-      <Text color={t.color.gold} wrap="truncate-end">
+      <Text color={t.color.primary} wrap="truncate-end">
         {memoryLike ? item.name : item.summary}
       </Text>
       {memoryLike ? <Text color={t.color.text}>{item.summary}</Text> : null}
-      {item.count ? <Text color={t.color.dim}>used: {item.count}×</Text> : null}
-      {item.learned_from ? <Text color={t.color.dim}>from: {item.learned_from}</Text> : null}
-      {item.via ? <Text color={t.color.dim}>via: {item.via}</Text> : null}
-      {item.last_used_at ? <Text color={t.color.dim}>last used: {fmtTime(item.last_used_at)}</Text> : null}
-      <Text color={t.color.dim}>source: {item.source}</Text>
+      {item.count ? <Text color={t.color.muted}>used: {item.count}×</Text> : null}
+      {item.learned_from ? <Text color={t.color.muted}>from: {item.learned_from}</Text> : null}
+      {item.via ? <Text color={t.color.muted}>via: {item.via}</Text> : null}
+      {item.last_used_at ? <Text color={t.color.muted}>last used: {fmtTime(item.last_used_at)}</Text> : null}
+      <Text color={t.color.muted}>source: {item.source}</Text>
     </Box>
   )
 }

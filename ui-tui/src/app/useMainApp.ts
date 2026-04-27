@@ -52,7 +52,7 @@ const capHistory = (items: Msg[]): Msg[] => {
   return items[0]?.kind === 'intro' ? [items[0]!, ...items.slice(-(MAX_HISTORY - 1))] : items.slice(-MAX_HISTORY)
 }
 
-const statusColorOf = (status: string, t: { dim: string; error: string; ok: string; warn: string }) => {
+const statusColorOf = (status: string, t: { error: string; muted: string; ok: string; warn: string }) => {
   if (status === 'ready') {
     return t.ok
   }
@@ -65,7 +65,7 @@ const statusColorOf = (status: string, t: { dim: string; error: string; ok: stri
     return t.warn
   }
 
-  return t.dim
+  return t.muted
 }
 
 export function useMainApp(gw: GatewayClient) {

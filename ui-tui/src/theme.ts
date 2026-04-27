@@ -1,9 +1,9 @@
 export interface ThemeColors {
-  gold: string
-  amber: string
-  bronze: string
+  primary: string
+  accent: string
+  border: string
   text: string
-  dim: string
+  muted: string
   completionBg: string
   completionCurrentBg: string
 
@@ -90,16 +90,16 @@ const BRAND: ThemeBrand = {
 
 export const DARK_THEME: Theme = {
   color: {
-    gold: '#FFD700',
-    amber: '#FFBF00',
-    bronze: '#CD7F32',
+    primary: '#FFD700',
+    accent: '#FFBF00',
+    border: '#CD7F32',
     text: '#FFF8DC',
+    muted: '#CC9B1F',
     // Bumped from the old `#B8860B` darkgoldenrod (~53% luminance) which
     // read as barely-visible on dark terminals for long body text.  The
     // new value sits ~60% luminance — readable without losing the "muted /
     // secondary" semantic.  Field labels still use `label` (65%) which
     // stays brighter so hierarchy holds.
-    dim: '#CC9B1F',
     completionBg: '#FFFFFF',
     completionCurrentBg: mix('#FFFFFF', '#FFBF00', 0.25),
 
@@ -141,11 +141,11 @@ export const DARK_THEME: Theme = {
 // cleanly (#11300).
 export const LIGHT_THEME: Theme = {
   color: {
-    gold: '#8B6914',
-    amber: '#A0651C',
-    bronze: '#7A4F1F',
+    primary: '#8B6914',
+    accent: '#A0651C',
+    border: '#7A4F1F',
     text: '#3D2F13',
-    dim: '#7A5A0F',
+    muted: '#7A5A0F',
     completionBg: '#F5F5F5',
     completionCurrentBg: mix('#F5F5F5', '#A0651C', 0.25),
 
@@ -213,19 +213,19 @@ export function fromSkin(
   const d = DEFAULT_THEME
   const c = (k: string) => colors[k]
 
-  const amber = c('ui_accent') ?? c('banner_accent') ?? d.color.amber
-  const accent = c('banner_accent') ?? c('banner_title') ?? d.color.amber
-  const dim = c('banner_dim') ?? d.color.dim
+  const accent = c('ui_accent') ?? c('banner_accent') ?? d.color.accent
+  const bannerAccent = c('banner_accent') ?? c('banner_title') ?? d.color.accent
+  const muted = c('banner_dim') ?? d.color.muted
 
   return {
     color: {
-      gold: c('banner_title') ?? d.color.gold,
-      amber,
-      bronze: c('banner_border') ?? d.color.bronze,
+      primary: c('ui_primary') ?? c('banner_title') ?? d.color.primary,
+      accent,
+      border: c('ui_border') ?? c('banner_border') ?? d.color.border,
       text: c('ui_text') ?? c('banner_text') ?? d.color.text,
-      dim,
+      muted,
       completionBg: c('completion_menu_bg') ?? d.color.completionBg,
-      completionCurrentBg: c('completion_menu_current_bg') ?? mix(d.color.completionBg, accent, 0.25),
+      completionCurrentBg: c('completion_menu_current_bg') ?? mix(d.color.completionBg, bannerAccent, 0.25),
 
       label: c('ui_label') ?? d.color.label,
       ok: c('ui_ok') ?? d.color.ok,
@@ -233,8 +233,8 @@ export function fromSkin(
       warn: c('ui_warn') ?? d.color.warn,
 
       prompt: c('prompt') ?? c('banner_text') ?? d.color.prompt,
-      sessionLabel: c('session_label') ?? dim,
-      sessionBorder: c('session_border') ?? dim,
+      sessionLabel: c('session_label') ?? muted,
+      sessionBorder: c('session_border') ?? muted,
 
       statusBg: d.color.statusBg,
       statusFg: d.color.statusFg,

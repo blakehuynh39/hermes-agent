@@ -79,15 +79,15 @@ const FILTER_PREDICATES: Record<FilterMode, (n: SubagentNode) => boolean> = {
 }
 
 const STATUS_GLYPH: Record<Status, { color: (t: Theme) => string; glyph: string }> = {
-  running: { color: t => t.color.amber, glyph: '●' },
-  queued: { color: t => t.color.dim, glyph: '○' },
+  running: { color: t => t.color.accent, glyph: '●' },
+  queued: { color: t => t.color.muted, glyph: '○' },
   completed: { color: t => t.color.statusGood, glyph: '✓' },
   interrupted: { color: t => t.color.warn, glyph: '■' },
   failed: { color: t => t.color.error, glyph: '✗' }
 }
 
 // Heatmap palette — cold → hot, resolved against the active theme.
-const heatPalette = (t: Theme) => [t.color.bronze, t.color.amber, t.color.gold, t.color.warn, t.color.error]
+const heatPalette = (t: Theme) => [t.color.border, t.color.accent, t.color.primary, t.color.warn, t.color.error]
 
 // ── Pure helpers ─────────────────────────────────────────────────────
 
@@ -160,8 +160,8 @@ function OverlayScrollbar({
 
   const vBar = (n: number) => (n > 0 ? `${'│\n'.repeat(n - 1)}│` : '')
   const thumbBody = `${'┃\n'.repeat(Math.max(0, thumb - 1))}┃`
-  const thumbColor = grab !== null ? t.color.gold : t.color.amber
-  const trackColor = hover ? t.color.bronze : t.color.dim
+  const thumbColor = grab !== null ? t.color.primary : t.color.accent
+  const trackColor = hover ? t.color.border : t.color.muted
 
   const jump = (row: number, offset: number) => {
     if (!s || !scrollable) {
@@ -301,7 +301,7 @@ function GanttStrip({
 
   return (
     <Box flexDirection="column" marginBottom={1}>
-      <Text color={t.color.dim}>
+      <Text color={t.color.muted}>
         Timeline · {fmtElapsedLabel(Math.max(0, totalSeconds))}
         {windowLabel}
       </Text>
@@ -309,7 +309,7 @@ function GanttStrip({
       {shown.map(({ endAt, idx, node, startAt }) => {
         const active = idx === cursor
         const { color } = statusGlyph(node.item, t)
-        const accent = active ? t.color.amber : t.color.dim
+        const accent = active ? t.color.accent : t.color.muted
 
         const elSec = displayElapsedSeconds(node.item, now)
         const elLabel = elSec != null ? fmtElapsedLabel(elSec) : ''
@@ -321,7 +321,7 @@ function GanttStrip({
               {'  '}
             </Text>
 
-            <Text color={active ? t.color.amber : color}>{bar(startAt, endAt)}</Text>
+            <Text color={active ? t.color.accent : color}>{bar(startAt, endAt)}</Text>
 
             {elLabel ? (
               <Text color={accent}>
@@ -333,13 +333,13 @@ function GanttStrip({
         )
       })}
 
-      <Text color={t.color.dim} dim>
+      <Text color={t.color.muted} dim>
         {'    '}
         {ruler}
       </Text>
 
       {totalSeconds > 0 ? (
-        <Text color={t.color.dim} dim>
+        <Text color={t.color.muted} dim>
           {'    '}
           {rulerLabels}
         </Text>
@@ -368,7 +368,7 @@ function OverlaySection({
     <Box flexDirection="column" marginTop={1}>
       <Box onClick={() => toggleOverlaySection(title, defaultOpen)}>
         <Text color={t.color.label}>
-          <Text color={t.color.amber}>{open ? '▾ ' : '▸ '}</Text>
+          <Text color={t.color.accent}>{open ? '▾ ' : '▸ '}</Text>
           {title}
           {typeof count === 'number' ? ` (${count})` : ''}
         </Text>
@@ -412,7 +412,7 @@ function Detail({ id, node, t }: { id?: string; node: SubagentNode; t: Theme }) 
   return (
     <Box flexDirection="column">
       <Text bold color={t.color.text} wrap="wrap">
-        {id ? <Text color={t.color.amber}>#{id} </Text> : null}
+        {id ? <Text color={t.color.accent}>#{id} </Text> : null}
         <Text color={color}>{glyph}</Text> {item.goal}
       </Text>
 
@@ -473,11 +473,11 @@ function Detail({ id, node, t }: { id?: string; node: SubagentNode; t: Theme }) 
 
           {filesRead.slice(0, 8).map((p, i) => (
             <Text color={t.color.text} key={`r-${i}`} wrap="truncate-end">
-              <Text color={t.color.dim}>·</Text> {p}
+              <Text color={t.color.muted}>·</Text> {p}
             </Text>
           ))}
 
-          {filesOverflow > 0 ? <Text color={t.color.dim}>…+{filesOverflow} more</Text> : null}
+          {filesOverflow > 0 ? <Text color={t.color.muted}>…+{filesOverflow} more</Text> : null}
         </OverlaySection>
       ) : null}
 
@@ -485,7 +485,7 @@ function Detail({ id, node, t }: { id?: string; node: SubagentNode; t: Theme }) 
         <OverlaySection count={toolLines.length} defaultOpen t={t} title="Tool calls">
           {toolLines.map((line, i) => (
             <Text color={t.color.text} key={i} wrap="wrap">
-              <Text color={t.color.dim}>·</Text> {line}
+              <Text color={t.color.muted}>·</Text> {line}
             </Text>
           ))}
         </OverlaySection>
@@ -495,7 +495,7 @@ function Detail({ id, node, t }: { id?: string; node: SubagentNode; t: Theme }) 
         <OverlaySection count={outputTail.length} defaultOpen t={t} title="Output">
           {outputTail.map((entry, i) => (
             <Text color={entry.isError ? t.color.error : t.color.text} key={i} wrap="wrap">
-              <Text bold color={entry.isError ? t.color.error : t.color.amber}>
+              <Text bold color={entry.isError ? t.color.error : t.color.accent}>
                 {entry.tool}
               </Text>{' '}
               {entry.preview}
@@ -552,16 +552,16 @@ function ListRow({
   const paren = line ? line.indexOf('(') : -1
   const toolShort = line ? (paren > 0 ? line.slice(0, paren) : line).trim() : ''
   const trailing = toolShort ? ` · ${compactPreview(toolShort, 14)}` : ''
-  const fg = active ? t.color.amber : t.color.text
+  const fg = active ? t.color.accent : t.color.text
 
   return (
     <Text bold={active} color={fg} inverse={active} wrap="truncate-end">
       {' '}
-      <Text color={active ? fg : t.color.dim}>{formatRowId(index)} </Text>
+      <Text color={active ? fg : t.color.muted}>{formatRowId(index)} </Text>
       {indentFor(node.item.depth)}
       {heatMarker ? <Text color={heatMarker}>▍</Text> : null}
       <Text color={active ? fg : color}>{glyph}</Text> {goal}
-      <Text color={active ? fg : t.color.dim}>
+      <Text color={active ? fg : t.color.muted}>
         {toolsCount}
         {kids}
         {trailing}
@@ -589,12 +589,12 @@ function DiffPane({
         {label}
       </Text>
 
-      <Text color={t.color.dim} wrap="truncate-end">
+      <Text color={t.color.muted} wrap="truncate-end">
         {snapshot.label}
       </Text>
 
       <Box marginTop={1}>
-        <Text color={t.color.dim} wrap="truncate-end">
+        <Text color={t.color.muted} wrap="truncate-end">
           {formatSummary(totals)}
         </Text>
       </Box>
@@ -606,7 +606,7 @@ function DiffPane({
             const { color, glyph } = statusGlyph(s, t)
 
             return (
-              <Text color={t.color.dim} key={s.id} wrap="truncate-end">
+              <Text color={t.color.muted} key={s.id} wrap="truncate-end">
                 <Text color={color}>{glyph}</Text> {s.goal || 'subagent'}
               </Text>
             )
@@ -644,10 +644,10 @@ function DiffView({
   return (
     <Box flexDirection="column" flexGrow={1} paddingX={1} paddingY={1}>
       <Box flexDirection="column" marginBottom={1}>
-        <Text bold color={t.color.bronze}>
+        <Text bold color={t.color.border}>
           Replay diff
         </Text>
-        <Text color={t.color.dim}>baseline vs candidate · esc/q close</Text>
+        <Text color={t.color.muted}>baseline vs candidate · esc/q close</Text>
       </Box>
 
       <Box flexDirection="row" marginBottom={1}>
@@ -657,7 +657,7 @@ function DiffView({
       </Box>
 
       <Box flexDirection="column" marginTop={1}>
-        <Text bold color={t.color.amber}>
+        <Text bold color={t.color.accent}>
           Δ
         </Text>
 
@@ -985,11 +985,11 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
     <Box alignItems="stretch" flexDirection="column" flexGrow={1} paddingX={1} paddingY={1}>
       <Box flexDirection="column" marginBottom={1}>
         <Text wrap="truncate-end">
-          <Text bold color={replayMode ? t.color.bronze : t.color.gold}>
+          <Text bold color={replayMode ? t.color.border : t.color.primary}>
             {title}
           </Text>
           {metaLine ? (
-            <Text color={t.color.dim}>
+            <Text color={t.color.muted}>
               {'   '}
               {metaLine}
             </Text>
@@ -999,7 +999,7 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
 
       {rows.length === 0 ? (
         <Box flexDirection="column" flexGrow={1}>
-          <Text color={t.color.dim}>No subagents this turn. Trigger delegate_task to populate the tree.</Text>
+          <Text color={t.color.muted}>No subagents this turn. Trigger delegate_task to populate the tree.</Text>
         </Box>
       ) : mode === 'list' ? (
         <Box flexDirection="column" flexGrow={1} flexShrink={1} minHeight={0}>
@@ -1034,17 +1034,17 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
       )}
 
       <Box flexDirection="column" marginTop={1}>
-        {flash ? <Text color={t.color.amber}>{flash}</Text> : null}
+        {flash ? <Text color={t.color.accent}>{flash}</Text> : null}
 
         {mode === 'list' ? (
-          <Text color={t.color.dim}>
+          <Text color={t.color.muted}>
             ↑↓/jk move · g/G top/bottom · Enter/→ open detail{controlsHint} · s sort:{SORT_LABEL[sort]} · f filter:
             {FILTER_LABEL[filter]}
             {history.length > 0 ? ` · [ / ] history ${historyIndex}/${history.length}` : ''}
             {' · q close'}
           </Text>
         ) : (
-          <Text color={t.color.dim}>
+          <Text color={t.color.muted}>
             ↑↓/jk scroll · PgUp/PgDn page · g/G top/bottom · Esc/← back to list{controlsHint} · q close
           </Text>
         )}
