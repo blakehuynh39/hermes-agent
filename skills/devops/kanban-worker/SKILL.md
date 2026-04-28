@@ -10,9 +10,7 @@ metadata:
 
 # Kanban Worker — Pitfalls and Examples
 
-> The **lifecycle** (6 steps: orient → work → heartbeat → block/complete) lives in the `KANBAN_GUIDANCE` block that is auto-injected into every kanban worker's system prompt. You don't need to load this skill to work a task — you already have the lifecycle in your context plus the `kanban_*` tools with self-explanatory descriptions.
->
-> This skill exists for the **edge cases and deeper examples** that don't fit in the guidance block.
+> You're seeing this skill because the Hermes Kanban dispatcher spawned you as a worker with `--skills kanban-worker` — it's loaded automatically for every dispatched worker. The **lifecycle** (6 steps: orient → work → heartbeat → block/complete) also lives in the `KANBAN_GUIDANCE` block that's auto-injected into your system prompt. This skill is the deeper detail: good handoff shapes, retry diagnostics, edge cases.
 
 ## Workspace handling
 

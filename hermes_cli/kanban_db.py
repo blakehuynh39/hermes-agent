@@ -2019,6 +2019,15 @@ def _default_spawn(task: Task, workspace: str) -> Optional[int]:
     cmd = [
         "hermes",
         "-p", task.assignee,
+        # Auto-load the kanban-worker skill so every dispatched worker
+        # has the pattern library (good summary/metadata shapes, retry
+        # diagnostics, block-reason examples) in its context, even if
+        # the profile hasn't wired it into skills config. The MANDATORY
+        # lifecycle is already in the system prompt via KANBAN_GUIDANCE;
+        # this skill is the deeper reference. Users can point a profile
+        # at a different/additional skill via config if they want —
+        # --skills is additive to the profile's default skill set.
+        "--skills", "kanban-worker",
         "chat",
         "-q", prompt,
     ]

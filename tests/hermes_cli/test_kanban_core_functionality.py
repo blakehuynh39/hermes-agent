@@ -2169,3 +2169,48 @@ def test_build_worker_context_caps_huge_summary(kanban_home):
         assert "truncated" in ctx
     finally:
         conn.close()
+
+
+def test_default_spawn_auto_loads_kanban_worker_skill(kanban_home, monkeypatch):
+    """The dispatcher's _default_spawn must include --skills kanban-worker
+    in its argv so every worker loads the skill automatically, even if
+    the profile hasn't wired it into its default skills config.
+
+    We intercept Popen to capture the argv without actually spawning a
+    hermes subprocess (which would hang trying to call an LLM).
+    """
+    captured = {}
+
+    class FakeProc:
+        def __init__(self):
+            self.pid = 99999
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env", {})
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="skill-loading test",
+                             assignee="some-profile")
+        task = kb.get_task(conn, tid)
+        workspace = kb.resolve_workspace(task)
+        pid = kb._default_spawn(task, str(workspace))
+        assert pid == 99999
+    finally:
+        conn.close()
+
+    cmd = captured["cmd"]
+    assert "--skills" in cmd, f"spawn argv missing --skills: {cmd}"
+    idx = cmd.index("--skills")
+    assert cmd[idx + 1] == "kanban-worker", (
+        f"expected 'kanban-worker', got {cmd[idx + 1]!r}"
+    )
+    # Assignee + task env are still present
+    assert "some-profile" in cmd
+    env = captured["env"]
+    assert env.get("HERMES_KANBAN_TASK") == tid
+    assert env.get("HERMES_PROFILE") == "some-profile"
