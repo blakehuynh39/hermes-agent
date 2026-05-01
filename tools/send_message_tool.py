@@ -589,11 +589,30 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- Slack: native file upload support via Slack files_upload_v2 ---
+    if platform == Platform.SLACK and media_files:
+        last_result = None
+        if not chunks:
+            chunks = [""]
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_slack(
+                pconfig.token,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files if is_last else [],
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal and yuanbao; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, slack, matrix, weixin, signal and yuanbao; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -601,7 +620,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal and yuanbao"
+            "native send_message media delivery is currently only supported for telegram, discord, slack, matrix, weixin, signal and yuanbao"
         )
 
     last_result = None
@@ -1003,7 +1022,78 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
         return _error(f"Discord send failed: {e}")
 
 
-async def _send_slack(token, chat_id, message, thread_id=None):
+def _slack_response_payload(data):
+    """Normalize Slack SDK responses to a dict-like payload."""
+    if isinstance(data, dict):
+        return data
+    payload = getattr(data, "data", None)
+    if isinstance(payload, dict):
+        return payload
+    try:
+        return dict(data)
+    except Exception:
+        return {}
+
+
+def _slack_upload_message_ts(data):
+    """Best-effort extraction of the Slack message ts from files_upload_v2."""
+    data = _slack_response_payload(data)
+    if not data:
+        return ""
+
+    direct = data.get("ts") or data.get("message_ts")
+    if direct:
+        return str(direct)
+
+    message = data.get("message")
+    if isinstance(message, dict) and message.get("ts"):
+        return str(message.get("ts"))
+
+    def _share_ts(file_obj):
+        shares = file_obj.get("shares") if isinstance(file_obj, dict) else None
+        if not isinstance(shares, dict):
+            return ""
+        for visibility in ("public", "private"):
+            by_channel = shares.get(visibility)
+            if not isinstance(by_channel, dict):
+                continue
+            for items in by_channel.values():
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if isinstance(item, dict) and item.get("ts"):
+                        return str(item.get("ts"))
+        return ""
+
+    files = data.get("files")
+    if isinstance(files, list):
+        for file_obj in files:
+            found = _share_ts(file_obj)
+            if found:
+                return found
+
+    file_obj = data.get("file")
+    if isinstance(file_obj, dict):
+        return _share_ts(file_obj)
+
+    return ""
+
+
+def _slack_uploaded_file_ids(data):
+    """Return uploaded Slack file IDs from a Slack SDK response payload."""
+    data = _slack_response_payload(data)
+    if not data:
+        return []
+    files = data.get("files")
+    if isinstance(files, list):
+        return [str(item.get("id")) for item in files if isinstance(item, dict) and item.get("id")]
+    file_obj = data.get("file")
+    if isinstance(file_obj, dict) and file_obj.get("id"):
+        return [str(file_obj.get("id"))]
+    return []
+
+
+async def _send_slack(token, chat_id, message, thread_id=None, media_files=None):
     """Send via Slack Web API."""
     try:
         import aiohttp
@@ -1013,6 +1103,71 @@ async def _send_slack(token, chat_id, message, thread_id=None):
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
         _proxy = resolve_proxy_url()
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+        media_files = media_files or []
+        if media_files:
+            try:
+                from slack_sdk.web.async_client import AsyncWebClient
+            except ImportError:
+                return {"error": "slack-sdk not installed. Run: pip install slack-sdk"}
+
+            file_uploads = []
+            warnings = []
+            for media_path, _is_voice in media_files:
+                if not os.path.exists(media_path):
+                    warning = f"Media file not found, skipping: {media_path}"
+                    logger.warning(warning)
+                    warnings.append(warning)
+                    continue
+                file_uploads.append({
+                    "file": media_path,
+                    "filename": os.path.basename(media_path),
+                })
+
+            if not file_uploads:
+                if message.strip():
+                    result = await _send_slack(token, chat_id, message, thread_id=thread_id)
+                    if warnings and isinstance(result, dict):
+                        result["warnings"] = warnings
+                    return result
+                error = "No deliverable text or media remained after processing"
+                if warnings:
+                    return {"error": error, "warnings": warnings}
+                return {"error": error}
+
+            upload_kwargs = {
+                "channel": chat_id,
+                "file_uploads": file_uploads,
+                "initial_comment": message or "",
+            }
+            if thread_id:
+                upload_kwargs["thread_ts"] = thread_id
+
+            try:
+                from gateway.platforms.slack import _resolve_slack_proxy_url
+                proxy = _resolve_slack_proxy_url()
+            except Exception:
+                proxy = _proxy
+
+            client = AsyncWebClient(token=token, proxy=proxy)
+            response = await client.files_upload_v2(**upload_kwargs)
+            data = _slack_response_payload(response)
+            if data and not data.get("ok", True):
+                return _error(f"Slack API error: {data.get('error', 'unknown')}")
+
+            result = {
+                "success": True,
+                "platform": "slack",
+                "chat_id": chat_id,
+                "message_id": _slack_upload_message_ts(data),
+                "file_ids": _slack_uploaded_file_ids(data),
+                "file_count": len(file_uploads),
+            }
+            if thread_id:
+                result["thread_id"] = thread_id
+            if warnings:
+                result["warnings"] = warnings
+            return result
+
         url = "https://slack.com/api/chat.postMessage"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
