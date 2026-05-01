@@ -265,6 +265,140 @@ def _resolve_slack_proxy_url() -> Optional[str]:
     return proxy_url
 
 
+def _slack_response_to_dict(response: Any) -> dict:
+    """Normalize Slack SDK responses to plain dictionaries."""
+    if isinstance(response, dict):
+        return response
+    data = getattr(response, "data", None)
+    if isinstance(data, dict):
+        return data
+    try:
+        return dict(response)
+    except Exception:
+        return {}
+
+
+def create_slack_web_client(token: Optional[str] = None) -> Any:
+    """Create a Slack Web API client using Hermes' native Slack settings.
+
+    ``SLACK_APP_TOKEN`` is only for Socket Mode ingress. Web API operations
+    such as reading history, posting messages, and uploading files use the bot
+    token.
+    """
+    if not SLACK_AVAILABLE:
+        raise RuntimeError("slack-sdk not installed. Install hermes-agent[messaging] or hermes-agent[slack].")
+    bot_token = (token or os.getenv("SLACK_BOT_TOKEN") or "").strip()
+    if not bot_token:
+        raise RuntimeError("SLACK_BOT_TOKEN not set")
+    client = AsyncWebClient(token=bot_token)
+    _apply_slack_proxy(client, _resolve_slack_proxy_url())
+    return client
+
+
+async def slack_read_thread(
+    channel_id: str,
+    thread_ts: str,
+    *,
+    token: Optional[str] = None,
+    limit: int = 50,
+    cursor: Optional[str] = None,
+    inclusive: bool = True,
+) -> dict:
+    """Read Slack thread messages via the native Slack Web API client."""
+    client = create_slack_web_client(token)
+    kwargs: dict[str, Any] = {
+        "channel": channel_id,
+        "ts": thread_ts,
+        "limit": limit,
+        "inclusive": inclusive,
+    }
+    if cursor:
+        kwargs["cursor"] = cursor
+    try:
+        return _slack_response_to_dict(await client.conversations_replies(**kwargs))
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            data = _slack_response_to_dict(response)
+            if data:
+                return data
+        return {"ok": False, "error": str(exc)}
+
+
+async def slack_read_channel(
+    channel_id: str,
+    *,
+    token: Optional[str] = None,
+    limit: int = 50,
+    cursor: Optional[str] = None,
+    oldest: Optional[str] = None,
+    latest: Optional[str] = None,
+) -> dict:
+    """Read recent Slack channel history via the native Slack Web API client."""
+    client = create_slack_web_client(token)
+    kwargs: dict[str, Any] = {"channel": channel_id, "limit": limit}
+    if cursor:
+        kwargs["cursor"] = cursor
+    if oldest:
+        kwargs["oldest"] = oldest
+    if latest:
+        kwargs["latest"] = latest
+    try:
+        return _slack_response_to_dict(await client.conversations_history(**kwargs))
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            data = _slack_response_to_dict(response)
+            if data:
+                return data
+        return {"ok": False, "error": str(exc)}
+
+
+async def slack_channel_info(
+    channel_id: str,
+    *,
+    token: Optional[str] = None,
+) -> dict:
+    """Fetch Slack conversation metadata via the native Slack Web API client."""
+    client = create_slack_web_client(token)
+    try:
+        return _slack_response_to_dict(await client.conversations_info(channel=channel_id))
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            data = _slack_response_to_dict(response)
+            if data:
+                return data
+        return {"ok": False, "error": str(exc)}
+
+
+async def slack_list_channels(
+    *,
+    token: Optional[str] = None,
+    limit: int = 100,
+    cursor: Optional[str] = None,
+    types: str = "public_channel,private_channel,mpim,im",
+) -> dict:
+    """List Slack conversations visible to the bot."""
+    client = create_slack_web_client(token)
+    kwargs: dict[str, Any] = {
+        "exclude_archived": True,
+        "types": types,
+        "limit": limit,
+    }
+    if cursor:
+        kwargs["cursor"] = cursor
+    try:
+        return _slack_response_to_dict(await client.conversations_list(**kwargs))
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            data = _slack_response_to_dict(response)
+            if data:
+                return data
+        return {"ok": False, "error": str(exc)}
+
+
 class SlackAdapter(BasePlatformAdapter):
     """
     Slack bot adapter using Socket Mode.
