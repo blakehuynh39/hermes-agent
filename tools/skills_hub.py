@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from hermes_constants import get_hermes_home
 from agent.skill_utils import is_excluded_skill_path
+from tools.skills_lock import skills_write_lock
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -3299,27 +3300,28 @@ def ensure_hub_dirs() -> None:
 
 def quarantine_bundle(bundle: SkillBundle) -> Path:
     """Write a skill bundle to the quarantine directory for scanning."""
-    ensure_hub_dirs()
-    skill_name = _validate_skill_name(bundle.name)
-    validated_files: List[Tuple[str, Union[str, bytes]]] = []
-    for rel_path, file_content in bundle.files.items():
-        safe_rel_path = _validate_bundle_rel_path(rel_path)
-        validated_files.append((safe_rel_path, file_content))
+    with skills_write_lock():
+        ensure_hub_dirs()
+        skill_name = _validate_skill_name(bundle.name)
+        validated_files: List[Tuple[str, Union[str, bytes]]] = []
+        for rel_path, file_content in bundle.files.items():
+            safe_rel_path = _validate_bundle_rel_path(rel_path)
+            validated_files.append((safe_rel_path, file_content))
 
-    dest = QUARANTINE_DIR / skill_name
-    if dest.exists():
-        shutil.rmtree(dest)
-    dest.mkdir(parents=True)
+        dest = QUARANTINE_DIR / skill_name
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True)
 
-    for rel_path, file_content in validated_files:
-        file_dest = dest.joinpath(*rel_path.split("/"))
-        file_dest.parent.mkdir(parents=True, exist_ok=True)
-        if isinstance(file_content, bytes):
-            file_dest.write_bytes(file_content)
-        else:
-            file_dest.write_text(file_content, encoding="utf-8")
+        for rel_path, file_content in validated_files:
+            file_dest = dest.joinpath(*rel_path.split("/"))
+            file_dest.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(file_content, bytes):
+                file_dest.write_bytes(file_content)
+            else:
+                file_dest.write_text(file_content, encoding="utf-8")
 
-    return dest
+        return dest
 
 
 def install_from_quarantine(
@@ -3330,111 +3332,113 @@ def install_from_quarantine(
     scan_result: ScanResult,
 ) -> Path:
     """Move a scanned skill from quarantine into the skills directory."""
-    safe_skill_name = _validate_skill_name(skill_name)
-    safe_category = _validate_install_parent_path(category) if category else ""
-    quarantine_resolved = quarantine_path.resolve()
-    quarantine_root = QUARANTINE_DIR.resolve()
-    if not quarantine_resolved.is_relative_to(quarantine_root):
-        raise ValueError(f"Unsafe quarantine path: {quarantine_path}")
+    with skills_write_lock():
+        safe_skill_name = _validate_skill_name(skill_name)
+        safe_category = _validate_install_parent_path(category) if category else ""
+        quarantine_resolved = quarantine_path.resolve()
+        quarantine_root = QUARANTINE_DIR.resolve()
+        if not quarantine_resolved.is_relative_to(quarantine_root):
+            raise ValueError(f"Unsafe quarantine path: {quarantine_path}")
 
-    if safe_category:
-        install_rel_path = f"{safe_category}/{safe_skill_name}"
-    else:
-        install_rel_path = safe_skill_name
+        if safe_category:
+            install_rel_path = f"{safe_category}/{safe_skill_name}"
+        else:
+            install_rel_path = safe_skill_name
 
-    # Resolve via the same lock-path validator the uninstaller uses. Catches
-    # symlink-in-skills-tree redirects at install time so the lock entry's
-    # path can never refer to a redirected target.
-    install_dir = _resolve_lock_install_path(install_rel_path, safe_skill_name)
+        # Resolve via the same lock-path validator the uninstaller uses.
+        # Catches symlink-in-skills-tree redirects at install time so the
+        # lock entry's path can never refer to a redirected target.
+        install_dir = _resolve_lock_install_path(install_rel_path, safe_skill_name)
 
-    if install_dir.exists():
-        shutil.rmtree(install_dir)
+        if install_dir.exists():
+            shutil.rmtree(install_dir)
 
-    # Warn (but don't block) if SKILL.md is very large
-    skill_md = quarantine_path / "SKILL.md"
-    if skill_md.exists():
-        try:
-            skill_size = skill_md.stat().st_size
-            if skill_size > 100_000:
-                logger.warning(
-                    "Skill '%s' has a large SKILL.md (%s chars). "
-                    "Large skills consume significant context when loaded. "
-                    "Consider asking the author to split it into smaller files.",
-                    safe_skill_name,
-                    f"{skill_size:,}",
-                )
-        except OSError:
-            pass
+        # Warn (but don't block) if SKILL.md is very large
+        skill_md = quarantine_path / "SKILL.md"
+        if skill_md.exists():
+            try:
+                skill_size = skill_md.stat().st_size
+                if skill_size > 100_000:
+                    logger.warning(
+                        "Skill '%s' has a large SKILL.md (%s chars). "
+                        "Large skills consume significant context when loaded. "
+                        "Consider asking the author to split it into smaller files.",
+                        safe_skill_name,
+                        f"{skill_size:,}",
+                    )
+            except OSError:
+                pass
 
-    # Reject symlinks inside the quarantined skill before moving it.
-    # A malicious skill bundle could include a symlink pointing outside the
-    # skills tree; its target contents would then be copied into skills/ and
-    # leaked to the agent on the next skill_view call.
-    for entry in quarantine_path.rglob("*"):
-        if not _is_path_redirect(entry):
-            continue
-        try:
-            rel = entry.relative_to(quarantine_resolved)
-        except ValueError:
-            rel = entry
-        raise ValueError(
-            f"Installed skill contains symlinks, which is not allowed: {rel}"
+        # Reject symlinks inside the quarantined skill before moving it.
+        # A malicious skill bundle could include a symlink pointing outside
+        # the skills tree; its target contents would then be copied into
+        # skills/ and leaked to the agent on the next skill_view call.
+        for entry in quarantine_path.rglob("*"):
+            if not _is_path_redirect(entry):
+                continue
+            try:
+                rel = entry.relative_to(quarantine_resolved)
+            except ValueError:
+                rel = entry
+            raise ValueError(
+                f"Installed skill contains symlinks, which is not allowed: {rel}"
+            )
+
+        install_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(quarantine_path), str(install_dir))
+
+        # Record in lock file
+        lock = HubLockFile()
+        lock.record_install(
+            name=safe_skill_name,
+            source=bundle.source,
+            identifier=bundle.identifier,
+            trust_level=bundle.trust_level,
+            scan_verdict=scan_result.verdict,
+            skill_hash=content_hash(install_dir),
+            install_path=str(install_dir.relative_to(SKILLS_DIR)),
+            files=list(bundle.files.keys()),
+            metadata=bundle.metadata,
         )
 
-    install_dir.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(quarantine_path), str(install_dir))
+        append_audit_log(
+            "INSTALL", safe_skill_name, bundle.source,
+            bundle.trust_level, scan_result.verdict,
+            content_hash(install_dir),
+        )
 
-    # Record in lock file
-    lock = HubLockFile()
-    lock.record_install(
-        name=safe_skill_name,
-        source=bundle.source,
-        identifier=bundle.identifier,
-        trust_level=bundle.trust_level,
-        scan_verdict=scan_result.verdict,
-        skill_hash=content_hash(install_dir),
-        install_path=str(install_dir.relative_to(SKILLS_DIR)),
-        files=list(bundle.files.keys()),
-        metadata=bundle.metadata,
-    )
-
-    append_audit_log(
-        "INSTALL", safe_skill_name, bundle.source,
-        bundle.trust_level, scan_result.verdict,
-        content_hash(install_dir),
-    )
-
-    return install_dir
+        return install_dir
 
 
 def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     """Remove a hub-installed skill. Refuses to remove builtins."""
-    lock = HubLockFile()
-    entry = lock.get_installed(skill_name)
-    if not entry:
-        return False, f"'{skill_name}' is not a hub-installed skill (may be a builtin)"
+    with skills_write_lock():
+        lock = HubLockFile()
+        entry = lock.get_installed(skill_name)
+        if not entry:
+            return False, f"'{skill_name}' is not a hub-installed skill (may be a builtin)"
 
-    # Validate the lock entry's install_path against the skill name. This is
-    # the destructive boundary — anything that falls through to the rmtree
-    # below MUST be inside SKILLS_DIR and MUST NOT be SKILLS_DIR itself
-    # (an empty/"."/"/" install_path would otherwise wipe the entire tree).
-    # _resolve_lock_install_path enforces a relative path ending in
-    # <skill_name>, rejects absolute/traversal paths, and walks the path
-    # component-by-component refusing symlink/junction redirects.
-    try:
-        install_path = _resolve_lock_install_path(
-            entry.get("install_path", ""), skill_name
-        )
-    except ValueError as exc:
-        return False, f"Refusing to uninstall '{skill_name}': {exc}"
+        # Validate the lock entry's install_path against the skill name. This
+        # is the destructive boundary — anything that falls through to the
+        # rmtree below MUST be inside SKILLS_DIR and MUST NOT be SKILLS_DIR
+        # itself (an empty/"."/"/" install_path would otherwise wipe the
+        # entire tree). _resolve_lock_install_path enforces a relative path
+        # ending in <skill_name>, rejects absolute/traversal paths, and walks
+        # the path component-by-component refusing symlink/junction redirects.
+        try:
+            install_path = _resolve_lock_install_path(
+                entry.get("install_path", ""), skill_name
+            )
+        except ValueError as exc:
+            return False, f"Refusing to uninstall '{skill_name}': {exc}"
 
-    if install_path.exists():
-        shutil.rmtree(install_path)
+        if install_path.exists():
+            shutil.rmtree(install_path)
 
-    lock.record_uninstall(skill_name)
-    append_audit_log("UNINSTALL", skill_name, entry["source"], entry["trust_level"], "n/a", "user_request")
+        lock.record_uninstall(skill_name)
+        append_audit_log("UNINSTALL", skill_name, entry["source"], entry["trust_level"], "n/a", "user_request")
 
-    return True, f"Uninstalled '{skill_name}' from {entry['install_path']}"
+        return True, f"Uninstalled '{skill_name}' from {entry['install_path']}"
 
 
 def bundle_content_hash(bundle: SkillBundle) -> str:
