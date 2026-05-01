@@ -4013,6 +4013,81 @@ class SlackAdapter(BasePlatformAdapter):
 # ──────────────────────────────────────────────────────────────────────────
 
 
+def _slack_response_payload(data):
+    """Normalize Slack SDK responses to a dict-like payload."""
+    if isinstance(data, dict):
+        return data
+    payload = getattr(data, "data", None)
+    if isinstance(payload, dict):
+        return payload
+    try:
+        return dict(data)
+    except Exception:
+        return {}
+
+
+def _slack_upload_message_ts(data) -> str:
+    """Best-effort extraction of the Slack message ts from files_upload_v2."""
+    data = _slack_response_payload(data)
+    if not data:
+        return ""
+
+    direct = data.get("ts") or data.get("message_ts")
+    if direct:
+        return str(direct)
+
+    message = data.get("message")
+    if isinstance(message, dict) and message.get("ts"):
+        return str(message.get("ts"))
+
+    def _share_ts(file_obj):
+        shares = file_obj.get("shares") if isinstance(file_obj, dict) else None
+        if not isinstance(shares, dict):
+            return ""
+        for visibility in ("public", "private"):
+            by_channel = shares.get(visibility)
+            if not isinstance(by_channel, dict):
+                continue
+            for items in by_channel.values():
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if isinstance(item, dict) and item.get("ts"):
+                        return str(item.get("ts"))
+        return ""
+
+    files = data.get("files")
+    if isinstance(files, list):
+        for file_obj in files:
+            found = _share_ts(file_obj)
+            if found:
+                return found
+
+    file_obj = data.get("file")
+    if isinstance(file_obj, dict):
+        return _share_ts(file_obj)
+
+    return ""
+
+
+def _slack_uploaded_file_ids(data) -> List[str]:
+    """Return uploaded Slack file IDs from a Slack SDK response payload."""
+    data = _slack_response_payload(data)
+    if not data:
+        return []
+    files = data.get("files")
+    if isinstance(files, list):
+        return [
+            str(item.get("id"))
+            for item in files
+            if isinstance(item, dict) and item.get("id")
+        ]
+    file_obj = data.get("file")
+    if isinstance(file_obj, dict) and file_obj.get("id"):
+        return [str(file_obj.get("id"))]
+    return []
+
+
 async def _standalone_send(
     pconfig,
     chat_id,
@@ -4037,6 +4112,7 @@ async def _standalone_send(
     if not token:
         return {"error": "Slack send failed: SLACK_BOT_TOKEN not configured"}
 
+    media_files = media_files or []
     formatted = message
     if message:
         try:
@@ -4047,6 +4123,58 @@ async def _standalone_send(
                 "Failed to apply Slack mrkdwn formatting in _standalone_send",
                 exc_info=True,
             )
+
+    warnings = []
+    if media_files:
+        if not check_slack_requirements():
+            return {"error": "slack-sdk not installed. Run: pip install slack-sdk"}
+
+        file_uploads = []
+        for media_path, _is_voice in media_files:
+            if not os.path.exists(media_path):
+                warning = f"Media file not found, skipping: {media_path}"
+                logger.warning(warning)
+                warnings.append(warning)
+                continue
+            file_uploads.append({
+                "file": media_path,
+                "filename": os.path.basename(media_path),
+            })
+
+        if file_uploads:
+            upload_kwargs = {
+                "channel": chat_id,
+                "file_uploads": file_uploads,
+                "initial_comment": formatted or "",
+            }
+            if thread_id:
+                upload_kwargs["thread_ts"] = thread_id
+
+            client = AsyncWebClient(token=token, proxy=_resolve_slack_proxy_url())
+            response = await client.files_upload_v2(**upload_kwargs)
+            data = _slack_response_payload(response)
+            if data and not data.get("ok", True):
+                return {"error": f"Slack API error: {data.get('error', 'unknown')}"}
+
+            result = {
+                "success": True,
+                "platform": "slack",
+                "chat_id": chat_id,
+                "message_id": _slack_upload_message_ts(data),
+                "file_ids": _slack_uploaded_file_ids(data),
+                "file_count": len(file_uploads),
+            }
+            if thread_id:
+                result["thread_id"] = thread_id
+            if warnings:
+                result["warnings"] = warnings
+            return result
+
+        if not (formatted or "").strip():
+            error = "No deliverable text or media remained after processing"
+            if warnings:
+                return {"error": error, "warnings": warnings}
+            return {"error": error}
 
     try:
         import aiohttp
@@ -4074,12 +4202,17 @@ async def _standalone_send(
             ) as resp:
                 data = await resp.json()
                 if data.get("ok"):
-                    return {
+                    result = {
                         "success": True,
                         "platform": "slack",
                         "chat_id": chat_id,
                         "message_id": data.get("ts"),
                     }
+                    if thread_id:
+                        result["thread_id"] = thread_id
+                    if warnings:
+                        result["warnings"] = warnings
+                    return result
                 return {"error": f"Slack API error: {data.get('error', 'unknown')}"}
     except Exception as e:
         return {"error": f"Slack send failed: {e}"}

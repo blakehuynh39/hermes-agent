@@ -31,6 +31,7 @@ from tools.send_message_tool import (
     _parse_target_ref,
     _send_matrix_via_adapter,
     _send_signal,
+    _send_slack,
     _send_telegram,
     _send_to_platform,
     send_message_tool,
@@ -153,7 +154,7 @@ class _patch_slack_standalone_sender:
         self._entry = None
         self._original = None
 
-    async def _adapter(self, pconfig, chat_id, message, *, thread_id=None, **_kw):
+    async def _adapter(self, pconfig, chat_id, message, *, thread_id=None, media_files=None, **_kw):
         from plugins.platforms.slack.adapter import SlackAdapter
         formatted = message
         if message:
@@ -162,7 +163,10 @@ class _patch_slack_standalone_sender:
             except Exception:
                 pass
         token = getattr(pconfig, "token", None)
-        return await self._mock(token, chat_id, formatted, thread_ts=thread_id)
+        kwargs = {"thread_ts": thread_id}
+        if media_files is not None:
+            kwargs["media_files"] = media_files
+        return await self._mock(token, chat_id, formatted, **kwargs)
 
     def __enter__(self):
         self._entry = _slack_entry()
@@ -733,6 +737,37 @@ class TestSendToPlatformChunking:
             thread_ts="171000001.000100",
         )
 
+    def test_slack_media_is_uploaded_on_last_chunk(self, tmp_path, monkeypatch):
+        _ensure_slack_mock(monkeypatch)
+
+        import plugins.platforms.slack.adapter as slack_mod
+
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        image_path = tmp_path / "diagram.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+        send = AsyncMock(return_value={"success": True, "message_id": "171000002.000200"})
+
+        with _patch_slack_standalone_sender(send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123456789",
+                    "Here is the diagram",
+                    thread_id="171000001.000100",
+                    media_files=[(str(image_path), False)],
+                )
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with(
+            "***",
+            "C123456789",
+            "Here is the diagram",
+            thread_ts="171000001.000100",
+            media_files=[(str(image_path), False)],
+        )
+
     def test_slack_thread_send_includes_thread_ts(self, monkeypatch):
         import gateway.platforms.base as base_mod
         from plugins.platforms.slack import adapter as slack_adapter
@@ -782,6 +817,69 @@ class TestSendToPlatformChunking:
         assert result["chat_id"] == "C123456789"
         assert result["message_id"] == "171000002.000200"
         assert posted["kwargs"]["json"]["thread_ts"] == "171000001.000100"
+
+    def test_slack_media_upload_includes_thread_ts(self, tmp_path, monkeypatch):
+        import plugins.platforms.slack.adapter as slack_mod
+
+        image_path = tmp_path / "diagram.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+        captured = {}
+
+        class FakeSlackClient:
+            def __init__(self, token, proxy=None):
+                captured["token"] = token
+                captured["proxy"] = proxy
+
+            async def files_upload_v2(self, **kwargs):
+                captured["upload_kwargs"] = kwargs
+                return {
+                    "ok": True,
+                    "files": [
+                        {
+                            "id": "F123",
+                            "shares": {
+                                "public": {
+                                    "C123456789": [
+                                        {"ts": "171000002.000200"},
+                                    ],
+                                },
+                            },
+                        },
+                    ],
+                }
+
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        monkeypatch.setattr(slack_mod, "AsyncWebClient", FakeSlackClient)
+        monkeypatch.setattr(slack_mod, "_resolve_slack_proxy_url", lambda: "http://proxy.internal:8080")
+
+        result = asyncio.run(
+            slack_mod._standalone_send(
+                SimpleNamespace(token="xoxb-token", extra={}),
+                "C123456789",
+                "Here is the diagram",
+                thread_id="171000001.000100",
+                media_files=[(str(image_path), False)],
+            )
+        )
+
+        assert result == {
+            "success": True,
+            "platform": "slack",
+            "chat_id": "C123456789",
+            "message_id": "171000002.000200",
+            "file_ids": ["F123"],
+            "file_count": 1,
+            "thread_id": "171000001.000100",
+        }
+        assert captured["token"] == "xoxb-token"
+        assert captured["proxy"] == "http://proxy.internal:8080"
+        upload_kwargs = captured["upload_kwargs"]
+        assert upload_kwargs["channel"] == "C123456789"
+        assert upload_kwargs["initial_comment"] == "Here is the diagram"
+        assert upload_kwargs["thread_ts"] == "171000001.000100"
+        assert upload_kwargs["file_uploads"] == [
+            {"file": str(image_path), "filename": "diagram.png"},
+        ]
 
     def test_slack_bold_italic_formatted_before_send(self, monkeypatch):
         """Bold+italic ***text*** survives tool-layer formatting."""
