@@ -701,6 +701,88 @@ class TestSendToPlatformChunking:
             thread_ts=None,
         )
 
+    def test_slack_thread_target_is_parsed_and_sent(self, monkeypatch):
+        _ensure_slack_mock(monkeypatch)
+
+        import plugins.platforms.slack.adapter as slack_mod
+
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        send = _make_recording_slack_sender()
+        channel_id, thread_id, explicit = _parse_target_ref("slack", "C123456789:171000001.000100")
+
+        assert channel_id == "C123456789"
+        assert thread_id == "171000001.000100"
+        assert explicit is True
+
+        with _patch_slack_standalone_sender(send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    channel_id,
+                    "thread reply",
+                    thread_id=thread_id,
+                )
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with(
+            "***",
+            "C123456789",
+            "thread reply",
+            thread_ts="171000001.000100",
+        )
+
+    def test_slack_thread_send_includes_thread_ts(self, monkeypatch):
+        import gateway.platforms.base as base_mod
+        from plugins.platforms.slack import adapter as slack_adapter
+
+        posted = {}
+
+        class FakeResponse:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def json(self):
+                return {"ok": True, "ts": "171000002.000200"}
+
+        class FakeSession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            def post(self, url, **kwargs):
+                posted["url"] = url
+                posted["kwargs"] = kwargs
+                return FakeResponse()
+
+        monkeypatch.setattr(base_mod, "resolve_proxy_url", lambda: None)
+        monkeypatch.setattr(base_mod, "proxy_kwargs_for_aiohttp", lambda _proxy: ({}, {}))
+        monkeypatch.setattr("aiohttp.ClientSession", FakeSession)
+
+        result = asyncio.run(
+            slack_adapter._standalone_send(
+                SimpleNamespace(token="xoxb-token", extra={}),
+                "C123456789",
+                "hello",
+                thread_id="171000001.000100",
+            )
+        )
+
+        assert result["success"] is True
+        assert result["platform"] == "slack"
+        assert result["chat_id"] == "C123456789"
+        assert result["message_id"] == "171000002.000200"
+        assert posted["kwargs"]["json"]["thread_ts"] == "171000001.000100"
+
     def test_slack_bold_italic_formatted_before_send(self, monkeypatch):
         """Bold+italic ***text*** survives tool-layer formatting."""
         _ensure_slack_mock(monkeypatch)
