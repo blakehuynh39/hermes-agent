@@ -1333,6 +1333,28 @@ class TestSchemaInit:
         mode = cursor.fetchone()[0]
         assert mode == "wal"
 
+    def test_env_can_use_delete_journal_mode_for_shared_fs(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_STATE_DB_JOURNAL_MODE", "DELETE")
+        session_db = SessionDB(db_path=tmp_path / "shared_state.db")
+        try:
+            cursor = session_db._conn.execute("PRAGMA journal_mode")
+            mode = cursor.fetchone()[0]
+            assert mode == "delete"
+            assert session_db._wal_enabled is False
+        finally:
+            session_db.close()
+
+    def test_invalid_env_journal_mode_falls_back_to_wal(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_STATE_DB_JOURNAL_MODE", "UNSUPPORTED")
+        session_db = SessionDB(db_path=tmp_path / "fallback_state.db")
+        try:
+            cursor = session_db._conn.execute("PRAGMA journal_mode")
+            mode = cursor.fetchone()[0]
+            assert mode == "wal"
+            assert session_db._wal_enabled is True
+        finally:
+            session_db.close()
+
     def test_foreign_keys_enabled(self, db):
         cursor = db._conn.execute("PRAGMA foreign_keys")
         assert cursor.fetchone()[0] == 1
