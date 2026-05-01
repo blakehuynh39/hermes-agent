@@ -16,6 +16,7 @@ Key design decisions:
 
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -708,6 +709,8 @@ class SessionDB:
         self._fts_enabled = False
         self._trigram_available = False
         self._fts_unavailable_warned = False
+        self._journal_mode = self._resolve_journal_mode()
+        self._wal_enabled = False
         self._conn = None
         try:
             if read_only:
@@ -746,7 +749,23 @@ class SessionDB:
                 )
                 self._conn.row_factory = sqlite3.Row
                 with self._shared_db_lock():
-                    apply_wal_with_fallback(self._conn, db_label="state.db")
+                    if self._journal_mode == "WAL":
+                        actual_journal_mode = apply_wal_with_fallback(
+                            self._conn,
+                            db_label="state.db",
+                        )
+                    else:
+                        actual_journal_mode = self._conn.execute(
+                            f"PRAGMA journal_mode={self._journal_mode}"
+                        ).fetchone()[0]
+                        if str(actual_journal_mode).upper() != self._journal_mode:
+                            logger.warning(
+                                "SQLite requested journal_mode=%s but got %s for %s",
+                                self._journal_mode,
+                                actual_journal_mode,
+                                self.db_path,
+                            )
+                    self._wal_enabled = str(actual_journal_mode).lower() == "wal"
                     self._conn.execute("PRAGMA foreign_keys=ON")
                     self._init_schema()
 
@@ -800,6 +819,27 @@ class SessionDB:
                 lock = threading.RLock()
                 cls._PROCESS_LOCKS[resolved] = lock
             return lock
+
+    @staticmethod
+    def _resolve_journal_mode() -> str:
+        """Resolve the SQLite journal mode for state.db.
+
+        WAL is the local-disk default and remains the fastest path for the
+        normal single-host CLI/gateway case. Shared network filesystems such
+        as EFS/NFS should use a rollback journal instead because WAL's shared
+        memory sidecar can surface intermittent ``disk I/O error`` failures
+        across pods. Operators can set ``HERMES_STATE_DB_JOURNAL_MODE=DELETE``
+        for those shared-home deployments.
+        """
+        raw = os.getenv("HERMES_STATE_DB_JOURNAL_MODE", "WAL").strip().upper()
+        allowed = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
+        if raw not in allowed:
+            logger.warning(
+                "Ignoring unsupported HERMES_STATE_DB_JOURNAL_MODE=%r; using WAL",
+                raw,
+            )
+            return "WAL"
+        return raw
 
     @contextmanager
     def _shared_db_lock(self):
@@ -1005,7 +1045,10 @@ class SessionDB:
                             raise
                 # Success — periodic best-effort checkpoint.
                 self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                if (
+                    self._wal_enabled
+                    and self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0
+                ):
                     self._try_wal_checkpoint()
                 return result
             except sqlite3.OperationalError as exc:
@@ -1044,6 +1087,8 @@ class SessionDB:
         writes) and already runs under ``self._lock``, so the
         additional hold time is negligible.
         """
+        if not self._wal_enabled:
+            return
         try:
             with self._shared_db_lock():
                 with self._lock:
@@ -1067,10 +1112,11 @@ class SessionDB:
         with self._shared_db_lock():
             with self._lock:
                 if self._conn:
-                    try:
-                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                    except Exception:
-                        pass
+                    if self._wal_enabled:
+                        try:
+                            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        except Exception:
+                            pass
                     self._conn.close()
                     self._conn = None
 
@@ -4971,13 +5017,15 @@ class SessionDB:
         except Exception as exc:
             logger.warning("FTS optimize before VACUUM failed: %s", exc)
         # VACUUM cannot be executed inside a transaction.
-        with self._lock:
-            # Best-effort WAL checkpoint first, then VACUUM.
-            try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception:
-                pass
-            self._conn.execute("VACUUM")
+        with self._shared_db_lock():
+            with self._lock:
+                # Best-effort WAL checkpoint first, then VACUUM.
+                if self._wal_enabled:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except Exception:
+                        pass
+                self._conn.execute("VACUUM")
         return optimized
 
     def maybe_auto_prune_and_vacuum(
