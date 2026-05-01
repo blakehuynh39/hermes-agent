@@ -29,6 +29,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, List, Tuple
 from utils import atomic_replace
+from tools.skills_lock import skills_write_lock
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +183,11 @@ def sync_skills(quiet: bool = False) -> dict:
         dict with keys: copied (list), updated (list), skipped (int),
                         user_modified (list), cleaned (list), total_bundled (int)
     """
+    with skills_write_lock():
+        return _sync_skills_unlocked(quiet=quiet)
+
+
+def _sync_skills_unlocked(quiet: bool = False) -> dict:
     bundled_dir = _get_bundled_dir()
     if not bundled_dir.exists():
         return {
@@ -342,6 +348,11 @@ def reset_bundled_skill(name: str, restore: bool = False) -> dict:
           - message: human-readable description
           - synced: dict from sync_skills() if a sync was triggered, else None
     """
+    with skills_write_lock():
+        return _reset_bundled_skill_unlocked(name=name, restore=restore)
+
+
+def _reset_bundled_skill_unlocked(name: str, restore: bool = False) -> dict:
     manifest = _read_manifest()
     bundled_dir = _get_bundled_dir()
     bundled_skills = _discover_bundled_skills(bundled_dir)
