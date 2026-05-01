@@ -1,5 +1,6 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
+import concurrent.futures
 import sqlite3
 import time
 import pytest
@@ -559,6 +560,38 @@ class TestMessageStorage:
         assert conversation[0]["observed"] is True
         assert isinstance(conversation[0].get("timestamp"), float)
         assert "observed" not in conversation[1]
+
+    def test_concurrent_independent_instances_serialize_writes(self, tmp_path):
+        db_path = tmp_path / "shared_state.db"
+        primary = SessionDB(db_path=db_path)
+        workers = 8
+        messages_per_worker = 10
+
+        def write_messages(worker_index):
+            local = SessionDB(db_path=db_path)
+            session_id = f"s{worker_index}"
+            local.ensure_session(
+                session_id,
+                source="test",
+                model="validation",
+            )
+            for message_index in range(messages_per_worker):
+                local.append_message(
+                    session_id,
+                    role="user",
+                    content=f"worker={worker_index} message={message_index}",
+                )
+            local.close()
+            return session_id
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            session_ids = list(executor.map(write_messages, range(workers)))
+
+        assert [
+            len(primary.get_messages_as_conversation(session_id) or [])
+            for session_id in session_ids
+        ] == [messages_per_worker] * workers
+        primary.close()
 
     def test_tool_response_does_not_increment_tool_count(self, db):
         """Tool responses (role=tool) should not increment tool_call_count.
@@ -3998,8 +4031,6 @@ class TestFTS5ToolCallMigration:
             assert version == SCHEMA_VERSION
         finally:
             session_db.close()
-
-
 # ---------------------------------------------------------------------------
 # apply_wal_with_fallback — read-only probe tests
 # ---------------------------------------------------------------------------
