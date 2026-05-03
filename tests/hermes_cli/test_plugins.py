@@ -3,6 +3,7 @@
 import logging
 import os
 import sys
+import tomllib
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -692,6 +693,13 @@ class TestPluginManagerList:
         plugin = next(p for p in listing if p["name"] == "rsi_platform_runtime")
         assert plugin["capabilities"]["execution_scoped_context_supported"] is True
         assert plugin["capabilities"]["execution_envelope_v1_producer"] is True
+
+    def test_bundled_plugin_manifests_are_packaged(self):
+        """Bundled plugins need manifests in wheels so discovery can load them."""
+        project_root = Path(__file__).resolve().parents[2]
+        config = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
+        package_data = config["tool"]["setuptools"]["package-data"]
+        assert "**/plugin.yaml" in package_data["plugins"]
 
 
 
