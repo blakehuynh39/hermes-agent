@@ -58,6 +58,7 @@ from datetime import datetime
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+from self_review_contracts import SelfReviewObservationV1
 
 
 _OPENAI_CLS_CACHE: Optional[type] = None
@@ -956,6 +957,7 @@ class AIAgent:
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
+        self_review_mode: str = "auto",
     ):
         """
         Initialize the AI Agent.
@@ -1028,6 +1030,9 @@ class AIAgent:
         # would mangle the escape sequences.  None = use builtins.print.
         self._print_fn = None
         self.background_review_callback = None  # Optional sync callback for gateway delivery
+        self.self_review_mode = (self_review_mode or "auto").strip().lower()
+        if self.self_review_mode not in {"auto", "manual", "disabled"}:
+            raise ValueError("self_review_mode must be one of: auto, manual, disabled")
         self.skip_context_files = skip_context_files
         self.load_soul_identity = load_soul_identity
         self.pass_session_id = pass_session_id
@@ -9422,11 +9427,14 @@ class AIAgent:
         for tool_call in tool_calls:
             function_name = tool_call.function.name
 
-            # Reset nudge counters
-            if function_name == "memory":
-                self._turns_since_memory = 0
-            elif function_name == "skill_manage":
-                self._iters_since_skill = 0
+            # Reset nudge counters only in automatic review mode. Manual mode
+            # reports observed deltas to the durable queue without mutating
+            # cadence on the live agent instance.
+            if self.self_review_mode == "auto":
+                if function_name == "memory":
+                    self._turns_since_memory = 0
+                elif function_name == "skill_manage":
+                    self._iters_since_skill = 0
 
             try:
                 function_args = json.loads(tool_call.function.arguments)
@@ -9829,11 +9837,14 @@ class AIAgent:
                 # callbacks, checkpointing, activity mutation, and real execution.
                 pass
             else:
-                # Reset nudge counters when the relevant tool is actually used
-                if function_name == "memory":
-                    self._turns_since_memory = 0
-                elif function_name == "skill_manage":
-                    self._iters_since_skill = 0
+                # Reset nudge counters when the relevant tool is actually used.
+                # Manual mode keeps these counters untouched and persists only
+                # observed deltas for later validated promotion.
+                if self.self_review_mode == "auto":
+                    if function_name == "memory":
+                        self._turns_since_memory = 0
+                    elif function_name == "skill_manage":
+                        self._iters_since_skill = 0
 
             if not self.quiet_mode:
                 args_str = json.dumps(function_args, ensure_ascii=False)
@@ -10524,14 +10535,20 @@ class AIAgent:
         # Track memory nudge trigger (turn-based, checked here).
         # Skill trigger is checked AFTER the agent loop completes, based on
         # how many tool iterations THIS turn used.
+        _self_review_manual = self.self_review_mode == "manual"
+        _self_review_disabled = self.self_review_mode == "disabled"
+        _memory_turn_delta = 0
+        _skill_iteration_delta = 0
         _should_review_memory = False
         if (self._memory_nudge_interval > 0
                 and "memory" in self.valid_tool_names
                 and self._memory_store):
-            self._turns_since_memory += 1
-            if self._turns_since_memory >= self._memory_nudge_interval:
-                _should_review_memory = True
-                self._turns_since_memory = 0
+            _memory_turn_delta = 1
+            if not _self_review_manual and not _self_review_disabled:
+                self._turns_since_memory += 1
+                if self._turns_since_memory >= self._memory_nudge_interval:
+                    _should_review_memory = True
+                    self._turns_since_memory = 0
 
         # Add user message
         user_msg = {"role": "user", "content": user_message}
@@ -10808,7 +10825,9 @@ class AIAgent:
             # Counter resets whenever skill_manage is actually used.
             if (self._skill_nudge_interval > 0
                     and "skill_manage" in self.valid_tool_names):
-                self._iters_since_skill += 1
+                _skill_iteration_delta += 1
+                if not _self_review_manual and not _self_review_disabled:
+                    self._iters_since_skill += 1
             
             # ── Pre-API-call /steer drain ──────────────────────────────────
             # If a /steer arrived during the previous API call (while the model
@@ -13839,11 +13858,63 @@ class AIAgent:
 
         # Check skill trigger NOW — based on how many tool iterations THIS turn used.
         _should_review_skills = False
-        if (self._skill_nudge_interval > 0
+        if (not _self_review_manual
+                and not _self_review_disabled
+                and self._skill_nudge_interval > 0
                 and self._iters_since_skill >= self._skill_nudge_interval
                 and "skill_manage" in self.valid_tool_names):
             _should_review_skills = True
             self._iters_since_skill = 0
+
+        if _self_review_manual:
+            observation = SelfReviewObservationV1(
+                execution_id=str(effective_task_id or ""),
+                session_id=str(self.session_id or ""),
+                parent_session_id=str(getattr(self, "_parent_session_id", "") or ""),
+                platform=str(getattr(self, "platform", "") or ""),
+                user_peer_id=str(getattr(self, "_user_id", "") or ""),
+                user_peer_name=str(getattr(self, "_user_name", "") or ""),
+                chat_id=str(getattr(self, "_chat_id", "") or ""),
+                thread_id=str(getattr(self, "_thread_id", "") or ""),
+                agent_identity=str(os.environ.get("RSI_HERMES_SELF_REVIEW_IDENTITY") or os.environ.get("RSI_HONCHO_AI_PEER") or ""),
+                memory_turn_delta=_memory_turn_delta,
+                skill_iteration_delta=_skill_iteration_delta,
+                memory_nudge_interval=int(getattr(self, "_memory_nudge_interval", 0) or 0),
+                skill_nudge_interval=int(getattr(self, "_skill_nudge_interval", 0) or 0),
+                memory_eligible=bool(
+                    self._memory_nudge_interval > 0
+                    and "memory" in self.valid_tool_names
+                    and self._memory_store
+                ),
+                skill_eligible=bool(
+                    self._skill_nudge_interval > 0
+                    and "skill_manage" in self.valid_tool_names
+                ),
+                completed=bool(completed),
+                interrupted=bool(interrupted),
+                final_response_present=bool(final_response),
+                api_calls=int(api_call_count or 0),
+                model=str(self.model or ""),
+                provider=str(self.provider or ""),
+                base_url=str(self.base_url or ""),
+                memory_target={
+                    "session_id": str(self.session_id or ""),
+                    "parent_session_id": str(getattr(self, "_parent_session_id", "") or ""),
+                    "platform": str(getattr(self, "platform", "") or ""),
+                    "user_peer_id": str(getattr(self, "_user_id", "") or ""),
+                    "chat_id": str(getattr(self, "_chat_id", "") or ""),
+                    "thread_id": str(getattr(self, "_thread_id", "") or ""),
+                    "memory_enabled": bool(getattr(self, "_memory_enabled", False)),
+                    "user_profile_enabled": bool(getattr(self, "_user_profile_enabled", False)),
+                },
+                skill_target={
+                    "agent_identity": str(os.environ.get("RSI_HERMES_SELF_REVIEW_IDENTITY") or os.environ.get("RSI_HONCHO_AI_PEER") or ""),
+                    "skills_enabled": "skill_manage" in self.valid_tool_names,
+                },
+                messages=list(messages),
+                final_response=str(final_response or ""),
+            )
+            result["self_review_observation"] = observation.to_dict()
 
         # External memory provider: sync the completed turn + queue next prefetch.
         self._sync_external_memory_for_turn(
@@ -13854,7 +13925,12 @@ class AIAgent:
 
         # Background memory/skill review — runs AFTER the response is delivered
         # so it never competes with the user's task for model attention.
-        if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+        if (
+            self.self_review_mode == "auto"
+            and final_response
+            and not interrupted
+            and (_should_review_memory or _should_review_skills)
+        ):
             try:
                 self._spawn_background_review(
                     messages_snapshot=list(messages),
