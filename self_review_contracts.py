@@ -35,9 +35,14 @@ class SelfReviewObservationV1:
     user_peer_name: str = ""
     chat_id: str = ""
     thread_id: str = ""
+    gateway_session_key: str = ""
     agent_identity: str = ""
+    cadence_scope_key: str = ""
     memory_turn_delta: int = 0
     skill_iteration_delta: int = 0
+    memory_tool_used: bool = False
+    skill_manage_used: bool = False
+    skill_iteration_delta_after_last_skill_manage: int = 0
     memory_nudge_interval: int = 0
     skill_nudge_interval: int = 0
     memory_eligible: bool = False
@@ -55,6 +60,7 @@ class SelfReviewObservationV1:
     final_response: str = ""
     loaded_skills: List[str] = field(default_factory=list)
     tool_trace_summary: List[Dict[str, Any]] = field(default_factory=list)
+    safe_review_context: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -76,9 +82,14 @@ class SelfReviewObservationV1:
             user_peer_name=str(payload.get("user_peer_name") or ""),
             chat_id=str(payload.get("chat_id") or ""),
             thread_id=str(payload.get("thread_id") or ""),
+            gateway_session_key=str(payload.get("gateway_session_key") or ""),
             agent_identity=str(payload.get("agent_identity") or ""),
+            cadence_scope_key=str(payload.get("cadence_scope_key") or ""),
             memory_turn_delta=int(payload.get("memory_turn_delta") or 0),
             skill_iteration_delta=int(payload.get("skill_iteration_delta") or 0),
+            memory_tool_used=bool(payload.get("memory_tool_used")),
+            skill_manage_used=bool(payload.get("skill_manage_used")),
+            skill_iteration_delta_after_last_skill_manage=int(payload.get("skill_iteration_delta_after_last_skill_manage") or 0),
             memory_nudge_interval=int(payload.get("memory_nudge_interval") or 0),
             skill_nudge_interval=int(payload.get("skill_nudge_interval") or 0),
             memory_eligible=bool(payload.get("memory_eligible")),
@@ -96,6 +107,7 @@ class SelfReviewObservationV1:
             final_response=str(payload.get("final_response") or ""),
             loaded_skills=[str(item) for item in _json_list(payload.get("loaded_skills")) if str(item or "").strip()],
             tool_trace_summary=[item for item in _json_list(payload.get("tool_trace_summary")) if isinstance(item, dict)],
+            safe_review_context=_json_object(payload.get("safe_review_context")),
         )
 
     def validate(self) -> None:
@@ -105,7 +117,11 @@ class SelfReviewObservationV1:
             raise ValueError("self-review observation requires execution_id")
         if not self.session_id:
             raise ValueError("self-review observation requires session_id")
-        if self.memory_turn_delta < 0 or self.skill_iteration_delta < 0:
+        if (
+            self.memory_turn_delta < 0
+            or self.skill_iteration_delta < 0
+            or self.skill_iteration_delta_after_last_skill_manage < 0
+        ):
             raise ValueError("self-review cadence deltas must be non-negative")
         if self.memory_eligible and not self.memory_target:
             raise ValueError("memory-eligible observations require memory_target")
