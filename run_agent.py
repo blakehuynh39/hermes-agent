@@ -3558,7 +3558,115 @@ class AIAgent:
             elif "removed" in message.lower() or "replaced" in message.lower():
                 label = "Memory" if target == "memory" else "User profile" if target == "user" else target
                 actions.append(f"{label} updated")
+            elif "patched" in message.lower() or "written" in message.lower():
+                actions.append(message)
         return actions
+
+    @staticmethod
+    def _tool_call_name(tool_call: Dict) -> str:
+        if not isinstance(tool_call, dict):
+            return ""
+        function = tool_call.get("function")
+        if isinstance(function, dict):
+            return str(function.get("name") or "").strip()
+        return str(tool_call.get("name") or "").strip()
+
+    @staticmethod
+    def _tool_call_args(tool_call: Dict) -> Dict[str, Any]:
+        if not isinstance(tool_call, dict):
+            return {}
+        function = tool_call.get("function")
+        raw_args = function.get("arguments") if isinstance(function, dict) else tool_call.get("arguments")
+        if isinstance(raw_args, dict):
+            return raw_args
+        if isinstance(raw_args, str) and raw_args.strip():
+            try:
+                parsed = json.loads(raw_args)
+            except (TypeError, json.JSONDecodeError):
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    @classmethod
+    def _build_self_review_safe_context(
+        cls,
+        messages: List[Dict],
+        *,
+        platform: str = "",
+        session_id: str = "",
+        parent_session_id: str = "",
+        user_peer_id: str = "",
+        chat_id: str = "",
+        thread_id: str = "",
+        gateway_session_key: str = "",
+    ) -> Dict[str, Any]:
+        """Return bounded, non-secret context for durable self-review.
+
+        RSI durable review intentionally skips repo/persona context files. This
+        summary carries the native review decision surface that is safe to store:
+        loaded skill names, tool names, tool status, and platform/session scope.
+        """
+        loaded_skills: List[str] = []
+        trace: List[Dict[str, Any]] = []
+        tool_results_by_id: Dict[str, Dict[str, Any]] = {}
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "tool":
+                tcid = str(msg.get("tool_call_id") or msg.get("call_id") or "").strip()
+                if not tcid:
+                    continue
+                success = None
+                content = msg.get("content")
+                if isinstance(content, str):
+                    try:
+                        parsed = json.loads(content)
+                        if isinstance(parsed, dict) and "success" in parsed:
+                            success = bool(parsed.get("success"))
+                    except (TypeError, json.JSONDecodeError):
+                        pass
+                tool_results_by_id[tcid] = {"success": success}
+        for msg in messages or []:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for tool_call in msg.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                name = cls._tool_call_name(tool_call)
+                if not name:
+                    continue
+                args = cls._tool_call_args(tool_call)
+                if name == "skill_view":
+                    skill_name = str(args.get("name") or args.get("skill") or "").strip()
+                    if skill_name and skill_name not in loaded_skills:
+                        loaded_skills.append(skill_name[:120])
+                tcid = str(tool_call.get("id") or tool_call.get("call_id") or "").strip()
+                result = tool_results_by_id.get(tcid, {})
+                trace.append(
+                    {
+                        "name": name[:120],
+                        "argument_keys": sorted(str(key)[:80] for key in args.keys())[:20],
+                        "success": result.get("success"),
+                    }
+                )
+                if len(trace) >= 80:
+                    break
+            if len(trace) >= 80:
+                break
+        return {
+            "schema": "hermes.safe_review_context.v1",
+            "platform_scope": {
+                "platform": str(platform or "")[:80],
+                "session_id": str(session_id or "")[:160],
+                "parent_session_id": str(parent_session_id or "")[:160],
+                "user_peer_id": str(user_peer_id or "")[:160],
+                "chat_id": str(chat_id or "")[:160],
+                "thread_id": str(thread_id or "")[:160],
+                "gateway_session_key": str(gateway_session_key or "")[:240],
+            },
+            "loaded_skills": loaded_skills[:40],
+            "tool_trace_summary": trace,
+        }
 
     def _spawn_background_review(
         self,
@@ -9845,7 +9953,6 @@ class AIAgent:
                         self._turns_since_memory = 0
                     elif function_name == "skill_manage":
                         self._iters_since_skill = 0
-
             if not self.quiet_mode:
                 args_str = json.dumps(function_args, ensure_ascii=False)
                 if self.verbose_logging:
@@ -10539,6 +10646,9 @@ class AIAgent:
         _self_review_disabled = self.self_review_mode == "disabled"
         _memory_turn_delta = 0
         _skill_iteration_delta = 0
+        _skill_iteration_delta_after_last_skill_manage = 0
+        _memory_tool_used = False
+        _skill_manage_used = False
         _should_review_memory = False
         if (self._memory_nudge_interval > 0
                 and "memory" in self.valid_tool_names
@@ -10826,6 +10936,7 @@ class AIAgent:
             if (self._skill_nudge_interval > 0
                     and "skill_manage" in self.valid_tool_names):
                 _skill_iteration_delta += 1
+                _skill_iteration_delta_after_last_skill_manage += 1
                 if not _self_review_manual and not _self_review_disabled:
                     self._iters_since_skill += 1
             
@@ -13867,6 +13978,35 @@ class AIAgent:
             self._iters_since_skill = 0
 
         if _self_review_manual:
+            _safe_review_context = self._build_self_review_safe_context(
+                list(messages),
+                platform=str(getattr(self, "platform", "") or ""),
+                session_id=str(self.session_id or ""),
+                parent_session_id=str(getattr(self, "_parent_session_id", "") or ""),
+                user_peer_id=str(getattr(self, "_user_id", "") or ""),
+                chat_id=str(getattr(self, "_chat_id", "") or ""),
+                thread_id=str(getattr(self, "_thread_id", "") or ""),
+                gateway_session_key=str(getattr(self, "_gateway_session_key", "") or ""),
+            )
+            _last_skill_manage_msg_idx = -1
+            _memory_tool_used = False
+            _skill_manage_used = False
+            for _idx, _msg in enumerate(messages):
+                if not isinstance(_msg, dict) or _msg.get("role") != "assistant":
+                    continue
+                for _tc in _msg.get("tool_calls") or []:
+                    _tname = self._tool_call_name(_tc)
+                    if _tname == "memory":
+                        _memory_tool_used = True
+                    elif _tname == "skill_manage":
+                        _skill_manage_used = True
+                        _last_skill_manage_msg_idx = _idx
+            if _skill_manage_used:
+                _skill_iteration_delta_after_last_skill_manage = sum(
+                    1
+                    for _msg in messages[_last_skill_manage_msg_idx + 1:]
+                    if isinstance(_msg, dict) and _msg.get("role") == "assistant" and _msg.get("tool_calls")
+                )
             observation = SelfReviewObservationV1(
                 execution_id=str(effective_task_id or ""),
                 session_id=str(self.session_id or ""),
@@ -13876,9 +14016,14 @@ class AIAgent:
                 user_peer_name=str(getattr(self, "_user_name", "") or ""),
                 chat_id=str(getattr(self, "_chat_id", "") or ""),
                 thread_id=str(getattr(self, "_thread_id", "") or ""),
+                gateway_session_key=str(getattr(self, "_gateway_session_key", "") or ""),
                 agent_identity=str(os.environ.get("RSI_HERMES_SELF_REVIEW_IDENTITY") or os.environ.get("RSI_HONCHO_AI_PEER") or ""),
+                cadence_scope_key=str(getattr(self, "_gateway_session_key", "") or self.session_id or ""),
                 memory_turn_delta=_memory_turn_delta,
                 skill_iteration_delta=_skill_iteration_delta,
+                memory_tool_used=bool(_memory_tool_used),
+                skill_manage_used=bool(_skill_manage_used),
+                skill_iteration_delta_after_last_skill_manage=int(_skill_iteration_delta_after_last_skill_manage or 0),
                 memory_nudge_interval=int(getattr(self, "_memory_nudge_interval", 0) or 0),
                 skill_nudge_interval=int(getattr(self, "_skill_nudge_interval", 0) or 0),
                 memory_eligible=bool(
@@ -13904,6 +14049,7 @@ class AIAgent:
                     "user_peer_id": str(getattr(self, "_user_id", "") or ""),
                     "chat_id": str(getattr(self, "_chat_id", "") or ""),
                     "thread_id": str(getattr(self, "_thread_id", "") or ""),
+                    "gateway_session_key": str(getattr(self, "_gateway_session_key", "") or ""),
                     "memory_enabled": bool(getattr(self, "_memory_enabled", False)),
                     "user_profile_enabled": bool(getattr(self, "_user_profile_enabled", False)),
                 },
@@ -13913,6 +14059,9 @@ class AIAgent:
                 },
                 messages=list(messages),
                 final_response=str(final_response or ""),
+                loaded_skills=list(_safe_review_context.get("loaded_skills") or []),
+                tool_trace_summary=list(_safe_review_context.get("tool_trace_summary") or []),
+                safe_review_context=_safe_review_context,
             )
             result["self_review_observation"] = observation.to_dict()
 
