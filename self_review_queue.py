@@ -612,16 +612,17 @@ def review_queue_status(config: SelfReviewConfig, reconcile_stale: bool = True) 
 
 def candidate_status(config: SelfReviewConfig, execution_id: str) -> Dict[str, Any]:
     db = _db(config)
-    with db._lock:
-        row = db._conn.execute("SELECT * FROM self_review_candidates WHERE execution_id=?", (execution_id,)).fetchone()
-        if not row:
-            db.close()
-            return {}
-        work = db._conn.execute(
-            "SELECT kind, status, result_summary, last_error FROM self_review_work_items WHERE candidate_id=? ORDER BY kind",
-            (row["candidate_id"],),
-        ).fetchall()
-    db.close()
+    try:
+        with db._lock:
+            row = db._conn.execute("SELECT * FROM self_review_candidates WHERE execution_id=?", (execution_id,)).fetchone()
+            if not row:
+                return {}
+            work = db._conn.execute(
+                "SELECT kind, status, result_summary, last_error FROM self_review_work_items WHERE candidate_id=? ORDER BY kind",
+                (row["candidate_id"],),
+            ).fetchall()
+    finally:
+        db.close()
     return {
         "candidate_id": int(row["candidate_id"]),
         "self_review_candidate_status": row["status"],
