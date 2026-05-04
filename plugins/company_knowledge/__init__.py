@@ -1,13 +1,15 @@
 """Native RSI company knowledge tools.
 
-The Platform source ledger is the authority. These tools call the Platform
-control-plane company-wiki API and never mutate Markdown files directly.
+The Platform source ledger is the authority. Mutating and DB-backed tools call
+the Platform control-plane company-wiki API; catalog reads prefer the mounted
+Markdown files that Hermes already uses for filesystem search.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,8 +25,20 @@ def _base_url() -> str:
     return os.getenv("RSI_CONTROL_PLANE_BASE_URL", "").strip().rstrip("/")
 
 
+def _wiki_root() -> Path | None:
+    root = os.getenv("RSI_COMPANY_WIKI_ROOT", "").strip()
+    if not root:
+        return None
+    return Path(root)
+
+
 def _check_available() -> bool:
     return bool(_base_url())
+
+
+def _check_read_available() -> bool:
+    root = _wiki_root()
+    return bool(_base_url() or (root is not None and root.exists()))
 
 
 def _api_request(method: str, path: str, *, params: dict[str, Any] | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -58,6 +72,46 @@ def _truncate(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
     return value[: max(0, limit - 3)] + "..."
+
+
+def _empty_markdown_read(relative_path: str) -> dict[str, Any]:
+    if relative_path == "index.md":
+        content = "# Company Wiki Index\n\n_No published pages yet._\n"
+    elif relative_path == "log.md":
+        content = "# Company Wiki Log\n\n_No wiki log entries yet._\n"
+    else:
+        content = ""
+    return {"ok": True, "path": relative_path, "content": content}
+
+
+def _read_local_wiki_markdown(relative_path: str) -> dict[str, Any] | None:
+    root = _wiki_root()
+    if root is None:
+        return None
+    relative_path = relative_path.strip().lstrip("/")
+    if not relative_path or ".." in Path(relative_path).parts:
+        raise ValueError("invalid wiki path")
+    if not root.exists():
+        return None
+    path = root / relative_path
+    if not path.exists():
+        return _empty_markdown_read(relative_path)
+    if not path.is_file():
+        raise ValueError(f"wiki path is not a file: {relative_path}")
+    return {"ok": True, "path": relative_path, "content": path.read_text(encoding="utf-8")}
+
+
+def _tail_wiki_log_entries(content: str, limit: int) -> str:
+    if limit <= 0:
+        return content
+    parts = content.split("\n## [")
+    if len(parts) <= 1:
+        return content
+    header = parts[0]
+    entries = parts[1:]
+    if len(entries) > limit:
+        entries = entries[-limit:]
+    return header + "\n" + "".join(f"\n## [{entry}" for entry in entries)
 
 
 def _as_int(raw: Any, *, default: int = 10, minimum: int = 1, maximum: int = 50) -> int:
@@ -103,6 +157,9 @@ def _handle_wiki_page_get(args: dict, **_kwargs) -> str:
 
 def _handle_wiki_index_get(args: dict, **_kwargs) -> str:
     try:
+        local = _read_local_wiki_markdown("index.md")
+        if local is not None:
+            return tool_result(local)
         return tool_result(_api_request("GET", "/internal/company-wiki/index"))
     except Exception as exc:
         return tool_error(f"wiki_index_get failed: {exc}")
@@ -111,6 +168,10 @@ def _handle_wiki_index_get(args: dict, **_kwargs) -> str:
 def _handle_wiki_log_get(args: dict, **_kwargs) -> str:
     limit = _as_int(args.get("limit"), default=20, maximum=100)
     try:
+        local = _read_local_wiki_markdown("log.md")
+        if local is not None:
+            local["content"] = _tail_wiki_log_entries(str(local.get("content") or ""), limit)
+            return tool_result(local)
         return tool_result(_api_request("GET", "/internal/company-wiki/log", params={"limit": limit}))
     except Exception as exc:
         return tool_error(f"wiki_log_get failed: {exc}")
@@ -262,7 +323,7 @@ def register(ctx) -> None:
         toolset=TOOLSET,
         schema=WIKI_INDEX_GET_SCHEMA,
         handler=_handle_wiki_index_get,
-        check_fn=_check_available,
+        check_fn=_check_read_available,
         description=WIKI_INDEX_GET_SCHEMA["description"],
     )
     ctx.register_tool(
@@ -270,7 +331,7 @@ def register(ctx) -> None:
         toolset=TOOLSET,
         schema=WIKI_LOG_GET_SCHEMA,
         handler=_handle_wiki_log_get,
-        check_fn=_check_available,
+        check_fn=_check_read_available,
         description=WIKI_LOG_GET_SCHEMA["description"],
     )
     ctx.register_tool(
