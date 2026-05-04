@@ -8,18 +8,23 @@ Markdown wiki is the published, agent-readable artifact.
 
 ## Read Path
 
-1. Start with `wiki_search` for company facts, runbooks, decisions, and
-   historical Slack/Notion evidence.
-2. Use `wiki_page_get` on the best matching page before answering.
-3. Cite source IDs from the page when stating company facts:
+1. Start with `wiki_index_get`. Read `index.md` first to find likely canonical
+   pages by category, title, summary, source count, and wiki revision id.
+2. Use `wiki_search` when the index is insufficient or the query spans many
+   topics.
+3. Use `wiki_page_get` on the best matching page before answering.
+4. Use `wiki_log_get` when recency matters. Every `log.md` entry starts with a
+   parseable prefix: `## [RFC3339] action | title`.
+5. Cite source IDs from the page when stating company facts:
    `source_document_id`, `source_revision_id`, and `chunk_id`.
-4. Surface conflicts when a page includes a conflict section or conflicting
+6. Surface conflicts when a page includes a conflict section or conflicting
    citations. Do not hide uncertainty.
 
 Local filesystem search is allowed only for inspection, for example:
 
 ```bash
 rg "deploy" "$RSI_COMPANY_WIKI_ROOT"
+grep '^## \[' "$RSI_COMPANY_WIKI_ROOT/log.md" | tail -5
 ```
 
 Do not edit wiki files with shell commands or generic file tools. Direct file
