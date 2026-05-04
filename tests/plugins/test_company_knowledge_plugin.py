@@ -17,7 +17,7 @@ def test_company_knowledge_registers_expected_tools():
     ctx = _FakeContext()
     company_knowledge.register(ctx)
     names = {tool["name"] for tool in ctx.tools}
-    assert names == {"wiki_search", "wiki_page_get", "wiki_edit_propose", "wiki_edit_apply"}
+    assert names == {"wiki_search", "wiki_page_get", "wiki_index_get", "wiki_log_get", "wiki_edit_propose", "wiki_edit_apply"}
     assert {tool["toolset"] for tool in ctx.tools} == {"company_knowledge"}
 
 
@@ -32,6 +32,32 @@ def test_wiki_page_get_encodes_slug(monkeypatch):
     out = json.loads(company_knowledge._handle_wiki_page_get({"page_ref": "runbooks/deploy v1"}))
     assert out["ok"] is True
     assert calls == [("GET", "/internal/company-wiki/pages/runbooks%2Fdeploy%20v1", None, None)]
+
+
+def test_wiki_index_get_reads_generated_catalog(monkeypatch):
+    calls = []
+
+    def fake_request(method, path, *, params=None, payload=None):
+        calls.append((method, path, params, payload))
+        return {"ok": True, "content": "# Company Wiki Index"}
+
+    monkeypatch.setattr(company_knowledge, "_api_request", fake_request)
+    out = json.loads(company_knowledge._handle_wiki_index_get({}))
+    assert out["ok"] is True
+    assert calls == [("GET", "/internal/company-wiki/index", None, None)]
+
+
+def test_wiki_log_get_clamps_limit(monkeypatch):
+    calls = []
+
+    def fake_request(method, path, *, params=None, payload=None):
+        calls.append((method, path, params, payload))
+        return {"ok": True, "content": "## [2026-05-03T00:00:00Z] ingest | Deploy"}
+
+    monkeypatch.setattr(company_knowledge, "_api_request", fake_request)
+    out = json.loads(company_knowledge._handle_wiki_log_get({"limit": 500}))
+    assert out["ok"] is True
+    assert calls == [("GET", "/internal/company-wiki/log", {"limit": 100}, None)]
 
 
 def test_wiki_edit_apply_preserves_structured_citations(monkeypatch):
@@ -66,4 +92,3 @@ def test_wiki_edit_apply_preserves_structured_citations(monkeypatch):
     _, path, _, payload = calls[0]
     assert path == "/internal/company-wiki/edits/apply"
     assert payload["citations"][0]["chunk_id"] == "srcchunk_1"
-
