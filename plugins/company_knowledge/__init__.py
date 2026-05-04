@@ -101,6 +101,21 @@ def _handle_wiki_page_get(args: dict, **_kwargs) -> str:
         return tool_error(f"wiki_page_get failed: {exc}")
 
 
+def _handle_wiki_index_get(args: dict, **_kwargs) -> str:
+    try:
+        return tool_result(_api_request("GET", "/internal/company-wiki/index"))
+    except Exception as exc:
+        return tool_error(f"wiki_index_get failed: {exc}")
+
+
+def _handle_wiki_log_get(args: dict, **_kwargs) -> str:
+    limit = _as_int(args.get("limit"), default=20, maximum=100)
+    try:
+        return tool_result(_api_request("GET", "/internal/company-wiki/log", params={"limit": limit}))
+    except Exception as exc:
+        return tool_error(f"wiki_log_get failed: {exc}")
+
+
 def _handle_wiki_edit_propose(args: dict, **_kwargs) -> str:
     try:
         payload = {
@@ -157,6 +172,26 @@ WIKI_PAGE_GET_SCHEMA = {
             "page_ref": {"type": "string", "description": "Wiki page id or slug."},
         },
         "required": ["page_ref"],
+    },
+}
+
+WIKI_INDEX_GET_SCHEMA = {
+    "name": "wiki_index_get",
+    "description": "Read the generated company wiki index.md catalog before drilling into relevant canonical pages.",
+    "parameters": {
+        "type": "object",
+        "properties": {},
+    },
+}
+
+WIKI_LOG_GET_SCHEMA = {
+    "name": "wiki_log_get",
+    "description": "Read recent append-only company wiki log.md entries. Entries start with '## [' for simple Unix parsing.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+        },
     },
 }
 
@@ -221,6 +256,22 @@ def register(ctx) -> None:
         handler=_handle_wiki_page_get,
         check_fn=_check_available,
         description=WIKI_PAGE_GET_SCHEMA["description"],
+    )
+    ctx.register_tool(
+        name="wiki_index_get",
+        toolset=TOOLSET,
+        schema=WIKI_INDEX_GET_SCHEMA,
+        handler=_handle_wiki_index_get,
+        check_fn=_check_available,
+        description=WIKI_INDEX_GET_SCHEMA["description"],
+    )
+    ctx.register_tool(
+        name="wiki_log_get",
+        toolset=TOOLSET,
+        schema=WIKI_LOG_GET_SCHEMA,
+        handler=_handle_wiki_log_get,
+        check_fn=_check_available,
+        description=WIKI_LOG_GET_SCHEMA["description"],
     )
     ctx.register_tool(
         name="wiki_edit_propose",
