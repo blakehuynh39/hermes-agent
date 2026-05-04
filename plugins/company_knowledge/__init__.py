@@ -95,7 +95,7 @@ def _handle_wiki_page_get(args: dict, **_kwargs) -> str:
     if not page_ref:
         return tool_error("wiki_page_get requires page_ref")
     try:
-        encoded = urllib.parse.quote(page_ref, safe="")
+        encoded = urllib.parse.quote(page_ref, safe="/")
         return tool_result(_api_request("GET", f"/internal/company-wiki/pages/{encoded}"))
     except Exception as exc:
         return tool_error(f"wiki_page_get failed: {exc}")

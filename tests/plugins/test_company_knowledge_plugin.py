@@ -21,7 +21,7 @@ def test_company_knowledge_registers_expected_tools():
     assert {tool["toolset"] for tool in ctx.tools} == {"company_knowledge"}
 
 
-def test_wiki_page_get_encodes_slug(monkeypatch):
+def test_wiki_page_get_preserves_slug_slashes(monkeypatch):
     calls = []
 
     def fake_request(method, path, *, params=None, payload=None):
@@ -31,7 +31,7 @@ def test_wiki_page_get_encodes_slug(monkeypatch):
     monkeypatch.setattr(company_knowledge, "_api_request", fake_request)
     out = json.loads(company_knowledge._handle_wiki_page_get({"page_ref": "runbooks/deploy v1"}))
     assert out["ok"] is True
-    assert calls == [("GET", "/internal/company-wiki/pages/runbooks%2Fdeploy%20v1", None, None)]
+    assert calls == [("GET", "/internal/company-wiki/pages/runbooks/deploy%20v1", None, None)]
 
 
 def test_wiki_index_get_reads_generated_catalog(monkeypatch):
