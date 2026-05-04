@@ -1,0 +1,7 @@
+name: company_knowledge
+version: "0.1.0"
+description: "RSI company wiki tools backed by Platform source ledger and audited Markdown publish path"
+capabilities:
+  company_wiki_tools: true
+  audited_writes: true
+  citation_required_apply: true
