@@ -1,8 +1,7 @@
 """Native RSI company knowledge tools.
 
-The Platform source ledger is the authority. Mutating and DB-backed tools call
-the Platform control-plane company-wiki API; catalog reads prefer the mounted
-Markdown files that Hermes already uses for filesystem search.
+The Platform source ledger is the authority for search and audited mutations.
+Catalog reads use the mounted company-computer Markdown files directly.
 """
 
 from __future__ import annotations
@@ -38,7 +37,7 @@ def _check_available() -> bool:
 
 def _check_read_available() -> bool:
     root = _wiki_root()
-    return bool(_base_url() or (root is not None and root.exists()))
+    return bool(root is not None and root.exists())
 
 
 def _api_request(method: str, path: str, *, params: dict[str, Any] | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -87,12 +86,12 @@ def _empty_markdown_read(relative_path: str) -> dict[str, Any]:
 def _read_local_wiki_markdown(relative_path: str) -> dict[str, Any] | None:
     root = _wiki_root()
     if root is None:
-        return None
+        raise RuntimeError("RSI_COMPANY_WIKI_ROOT is required for company wiki catalog reads")
     relative_path = relative_path.strip().lstrip("/")
     if not relative_path or ".." in Path(relative_path).parts:
         raise ValueError("invalid wiki path")
     if not root.exists():
-        return None
+        raise RuntimeError(f"company wiki root is unavailable: {root}")
     path = root / relative_path
     if not path.exists():
         return _empty_markdown_read(relative_path)
@@ -160,7 +159,7 @@ def _handle_wiki_index_get(args: dict, **_kwargs) -> str:
         local = _read_local_wiki_markdown("index.md")
         if local is not None:
             return tool_result(local)
-        return tool_result(_api_request("GET", "/internal/company-wiki/index"))
+        return tool_error("wiki_index_get failed: company wiki root is unavailable")
     except Exception as exc:
         return tool_error(f"wiki_index_get failed: {exc}")
 
@@ -172,7 +171,7 @@ def _handle_wiki_log_get(args: dict, **_kwargs) -> str:
         if local is not None:
             local["content"] = _tail_wiki_log_entries(str(local.get("content") or ""), limit)
             return tool_result(local)
-        return tool_result(_api_request("GET", "/internal/company-wiki/log", params={"limit": limit}))
+        return tool_error("wiki_log_get failed: company wiki root is unavailable")
     except Exception as exc:
         return tool_error(f"wiki_log_get failed: {exc}")
 
