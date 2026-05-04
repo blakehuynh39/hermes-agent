@@ -53,7 +53,7 @@ def test_wiki_index_get_reads_local_generated_catalog(monkeypatch, tmp_path):
     assert calls == []
 
 
-def test_wiki_index_get_falls_back_to_api_when_local_root_unset(monkeypatch):
+def test_wiki_index_get_requires_local_root(monkeypatch):
     calls = []
     monkeypatch.delenv("RSI_COMPANY_WIKI_ROOT", raising=False)
 
@@ -63,8 +63,9 @@ def test_wiki_index_get_falls_back_to_api_when_local_root_unset(monkeypatch):
 
     monkeypatch.setattr(company_knowledge, "_api_request", fake_request)
     out = json.loads(company_knowledge._handle_wiki_index_get({}))
-    assert out["ok"] is True
-    assert calls == [("GET", "/internal/company-wiki/index", None, None)]
+    assert "error" in out
+    assert "RSI_COMPANY_WIKI_ROOT" in out["error"]
+    assert calls == []
 
 
 def test_wiki_log_get_reads_local_log_and_clamps_limit(monkeypatch, tmp_path):
