@@ -617,7 +617,7 @@ def session_search(
 
 
 def check_session_search_requirements() -> bool:
-    """Requires the SQLite state database."""
+    """Requires the configured state database."""
     try:
         from hermes_state import DEFAULT_DB_PATH
         return DEFAULT_DB_PATH.parent.exists()
