@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 
+import self_review_queue as queue
 from self_review_contracts import SelfReviewObservationV1
 from self_review_queue import (
     SelfReviewConfig,
@@ -11,6 +13,92 @@ from self_review_queue import (
     recover_blocked_work,
     review_queue_status,
 )
+
+
+class _Rows:
+    def __init__(self, rows):
+        self._rows = rows
+        self.rowcount = len(rows)
+
+    def fetchall(self):
+        return list(self._rows)
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+
+class _FakePostgresConnection:
+    def __init__(self, raw: sqlite3.Connection):
+        self.raw = raw
+
+    def execute(self, sql: str, params=()):
+        if "information_schema.columns" in sql:
+            table_name = params[1]
+            rows = self.raw.execute(f"PRAGMA table_info({table_name})").fetchall()
+            return _Rows([{"name": row["name"]} for row in rows])
+        translated = self._translate(sql)
+        return self.raw.execute(translated, tuple(params or ()))
+
+    @staticmethod
+    def _translate(sql: str) -> str:
+        translated = sql.replace("%s", "?")
+        translated = translated.replace('"hermes_state".', "")
+        translated = translated.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+        translated = translated.replace("BIGINT", "INTEGER")
+        translated = translated.replace("DOUBLE PRECISION", "REAL")
+        translated = re.sub(r'CREATE INDEX IF NOT EXISTS "([^"]+)"', r"CREATE INDEX IF NOT EXISTS \1", translated)
+        translated = translated.replace('"', "")
+        return translated
+
+
+class _FakePostgresPool:
+    def __init__(self, raw: sqlite3.Connection):
+        self.raw = raw
+
+    def connection(self):
+        pool = self
+
+        class _Context:
+            def __enter__(self):
+                return _FakePostgresConnection(pool.raw)
+
+            def __exit__(self, exc_type, exc, tb):
+                if exc_type:
+                    pool.raw.rollback()
+                else:
+                    pool.raw.commit()
+                return False
+
+        return _Context()
+
+
+class _FakePostgresSessionDB:
+    _schema = "hermes_state"
+    _schema_sql = '"hermes_state"'
+
+    def __init__(self, db_path=None):
+        self._raw = sqlite3.connect(db_path)
+        self._raw.row_factory = sqlite3.Row
+        self._raw.execute("CREATE TABLE IF NOT EXISTS state_meta(key TEXT PRIMARY KEY, value TEXT)")
+        self._raw.commit()
+        self._pool = _FakePostgresPool(self._raw)
+
+    def _table(self, name: str) -> str:
+        return f'{self._schema_sql}."{name}"'
+
+    def _execute_write(self, fn, *, lock_key=None):
+        del lock_key
+        conn = _FakePostgresConnection(self._raw)
+        try:
+            result = fn(conn)
+            self._raw.commit()
+            return result
+        except BaseException:
+            self._raw.rollback()
+            raise
+
+    def close(self):
+        self._raw.close()
 
 
 def _config(tmp_path, identity: str = "rsi:test:company") -> SelfReviewConfig:
@@ -145,3 +233,27 @@ def test_manual_recovery_audits_blocked_work(tmp_path):
         conn.close()
     recovered = recover_blocked_work(config, work_id, "retry", actor="tester", reason="verified idempotent")
     assert recovered["status"] == "interrupted"
+
+
+def test_postgres_backed_queue_candidate_promote_and_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(queue, "SessionDB", _FakePostgresSessionDB)
+    config = _config(tmp_path)
+
+    candidate = apply_turn_review_candidate(config, _observation("exec-pg", memory_delta=2, skill_delta=2))
+    assert candidate["candidate_status"] == "candidate"
+    assert int(candidate["candidate_id"]) > 0
+
+    delivered = mark_candidate_delivered(config, "exec-pg", "hash-pg", result_ref="status-pg.json")
+    assert delivered["status"] == "validated"
+
+    promoted = promote_review_candidate(config, candidate["candidate_id"])
+    assert promoted["status"] == "enqueued"
+    assert promoted["work_created"] == ["combined"]
+
+    status = review_queue_status(config, reconcile_stale=False)
+    assert status["candidate_status_counts"] == {"enqueued": 1}
+    assert status["work_status_counts"] == {"combined:pending": 1}
+
+    candidate_details = queue.candidate_status(config, "exec-pg")
+    assert candidate_details["self_review_candidate_status"] == "enqueued"
+    assert candidate_details["self_review_status"] == "combined:pending"
