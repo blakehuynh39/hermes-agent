@@ -3369,3 +3369,32 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
+
+
+SQLiteSessionDB = SessionDB
+
+
+def _resolve_state_backend() -> str:
+    raw = os.getenv("HERMES_STATE_BACKEND", "sqlite").strip().lower()
+    if raw in {"", "sqlite"}:
+        return "sqlite"
+    if raw in {"postgres", "postgresql", "pg"}:
+        return "postgres"
+    logger.warning("Ignoring unsupported HERMES_STATE_BACKEND=%r; using sqlite", raw)
+    return "sqlite"
+
+
+class SessionDB(SQLiteSessionDB):
+    """Backend-selecting SessionDB facade.
+
+    SQLite remains the default local backend. Production deployments can set
+    ``HERMES_STATE_BACKEND=postgres`` to use managed Postgres without changing
+    existing imports such as ``from hermes_state import SessionDB``.
+    """
+
+    def __new__(cls, db_path: Path = None):
+        if cls is SessionDB and _resolve_state_backend() == "postgres":
+            from hermes_state_postgres import PostgresSessionDB
+
+            return PostgresSessionDB(db_path=db_path)
+        return super().__new__(cls)
