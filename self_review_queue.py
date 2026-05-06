@@ -29,6 +29,13 @@ REVIEW_SCHEMA_META_KEY = "self_review_schema_version"
 REVIEW_SCHEMA_VERSION = "2"
 RETRYABLE_PROMOTION_STATUSES = {"candidate", "validated", "pending_promote_retry"}
 BLOCKING_WORK_STATUSES = {"pending", "running", "interrupted", "blocked_after_side_effect_start"}
+REVIEW_TABLE_NAMES = (
+    "self_review_candidates",
+    "self_review_counters",
+    "self_review_cadence_counters",
+    "self_review_work_items",
+    "state_meta",
+)
 
 
 def _now() -> float:
@@ -65,6 +72,50 @@ def _json_loads_list(value: Any) -> List[Any]:
     except (TypeError, json.JSONDecodeError):
         return []
     return parsed if isinstance(parsed, list) else []
+
+
+def _is_postgres_db(db: Any) -> bool:
+    return callable(getattr(db, "_table", None)) and hasattr(db, "_pool")
+
+
+def _table(db: Any, name: str) -> str:
+    resolver = getattr(db, "_table", None)
+    return resolver(name) if callable(resolver) else name
+
+
+def _rewrite_sql(db: Any, sql: str) -> str:
+    if not _is_postgres_db(db):
+        return sql
+    rewritten = sql.replace("?", "%s")
+    for name in REVIEW_TABLE_NAMES:
+        rewritten = rewritten.replace(name, _table(db, name))
+    return rewritten
+
+
+def _execute(db: Any, conn: Any, sql: str, params: Iterable[Any] = ()) -> Any:
+    return conn.execute(_rewrite_sql(db, sql), tuple(params or ()))
+
+
+def _row_value(row: Any, key: str, index: int = 0, default: Any = None) -> Any:
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        return row[key]
+    except (KeyError, TypeError, IndexError):
+        try:
+            return row[index]
+        except (TypeError, IndexError):
+            return default
+
+
+def _execute_read(db: Any, fn: Any) -> Any:
+    if _is_postgres_db(db):
+        with db._pool.connection() as conn:
+            return fn(conn)
+    with db._lock:
+        return fn(db._conn)
 
 
 def _redact_error(exc: BaseException) -> str:
@@ -174,6 +225,174 @@ def _db(config: SelfReviewConfig) -> SessionDB:
 
 
 def ensure_review_schema(db: SessionDB) -> None:
+    if _is_postgres_db(db):
+        candidates = _table(db, "self_review_candidates")
+        counters = _table(db, "self_review_counters")
+        cadence = _table(db, "self_review_cadence_counters")
+        work_items = _table(db, "self_review_work_items")
+        state_meta = _table(db, "state_meta")
+        schema_name = getattr(db, "_schema", "")
+
+        def _columns(conn: Any, table_name: str) -> set[str]:
+            rows = conn.execute(
+                """
+                SELECT column_name AS name
+                FROM information_schema.columns
+                WHERE table_schema=%s AND table_name=%s
+                """,
+                (schema_name, table_name),
+            ).fetchall()
+            return {str(_row_value(row, "name", 0)) for row in rows}
+
+        def _index(name: str) -> str:
+            return f'"{name}"'
+
+        def _do_postgres(conn: Any) -> None:
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {candidates} (
+                    candidate_id BIGSERIAL PRIMARY KEY,
+                    execution_id TEXT NOT NULL UNIQUE,
+                    agent_identity TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at DOUBLE PRECISION NOT NULL,
+                    updated_at DOUBLE PRECISION NOT NULL,
+                    candidate_owner_executor_instance_id TEXT,
+                    candidate_owner_generation TEXT,
+                    native_envelope_validated_at DOUBLE PRECISION,
+                    delivered_at DOUBLE PRECISION,
+                    result_hash TEXT,
+                    result_ref TEXT,
+                    memory_turn_delta INTEGER NOT NULL DEFAULT 0,
+                    skill_iteration_delta INTEGER NOT NULL DEFAULT 0,
+                    skill_iteration_delta_after_last_skill_manage INTEGER NOT NULL DEFAULT 0,
+                    memory_nudge_interval INTEGER NOT NULL DEFAULT 0,
+                    skill_nudge_interval INTEGER NOT NULL DEFAULT 0,
+                    memory_eligible INTEGER NOT NULL DEFAULT 0,
+                    skill_eligible INTEGER NOT NULL DEFAULT 0,
+                    memory_tool_used INTEGER NOT NULL DEFAULT 0,
+                    skill_manage_used INTEGER NOT NULL DEFAULT 0,
+                    completed INTEGER NOT NULL DEFAULT 0,
+                    interrupted INTEGER NOT NULL DEFAULT 0,
+                    final_response_present INTEGER NOT NULL DEFAULT 0,
+                    gateway_session_key TEXT,
+                    cadence_scope_key TEXT,
+                    observation_json TEXT NOT NULL,
+                    memory_target_json TEXT NOT NULL DEFAULT '{{}}',
+                    skill_target_json TEXT NOT NULL DEFAULT '{{}}',
+                    safe_review_context_json TEXT NOT NULL DEFAULT '{{}}',
+                    snapshot_ref TEXT,
+                    snapshot_path TEXT,
+                    snapshot_hash TEXT,
+                    snapshot_size INTEGER NOT NULL DEFAULT 0,
+                    promotion_attempts INTEGER NOT NULL DEFAULT 0,
+                    promoted_at DOUBLE PRECISION,
+                    trigger_decision_json TEXT,
+                    last_error TEXT
+                )
+                """
+            )
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS {_index('idx_self_review_candidates_identity_order')} "
+                f"ON {candidates}(agent_identity, created_at, candidate_id)"
+            )
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS {_index('idx_self_review_candidates_status')} "
+                f"ON {candidates}(status)"
+            )
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {counters} (
+                    agent_identity TEXT PRIMARY KEY,
+                    memory_turns INTEGER NOT NULL DEFAULT 0,
+                    skill_iterations INTEGER NOT NULL DEFAULT 0,
+                    updated_at DOUBLE PRECISION NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {cadence} (
+                    cadence_scope_key TEXT PRIMARY KEY,
+                    agent_identity TEXT NOT NULL,
+                    memory_turns INTEGER NOT NULL DEFAULT 0,
+                    skill_iterations INTEGER NOT NULL DEFAULT 0,
+                    updated_at DOUBLE PRECISION NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {work_items} (
+                    work_id BIGSERIAL PRIMARY KEY,
+                    candidate_id BIGINT NOT NULL,
+                    execution_id TEXT NOT NULL,
+                    agent_identity TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at DOUBLE PRECISION NOT NULL,
+                    updated_at DOUBLE PRECISION NOT NULL,
+                    review_owner_executor_instance_id TEXT,
+                    review_owner_generation TEXT,
+                    lease_heartbeat_at DOUBLE PRECISION,
+                    last_progress_at DOUBLE PRECISION,
+                    batch_id TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    result_summary TEXT,
+                    review_kind TEXT,
+                    trigger_kind TEXT,
+                    action_categories_json TEXT NOT NULL DEFAULT '[]',
+                    retryable INTEGER NOT NULL DEFAULT 1,
+                    side_effect_started_at DOUBLE PRECISION,
+                    manual_recovery_json TEXT,
+                    last_error TEXT,
+                    UNIQUE(candidate_id, kind),
+                    FOREIGN KEY(candidate_id) REFERENCES {candidates}(candidate_id)
+                )
+                """
+            )
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS {_index('idx_self_review_work_status')} "
+                f"ON {work_items}(status, kind, agent_identity, created_at, work_id)"
+            )
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS {_index('idx_self_review_work_owner')} "
+                f"ON {work_items}(review_owner_executor_instance_id, review_owner_generation)"
+            )
+            candidate_columns = _columns(conn, "self_review_candidates")
+            for name, ddl in {
+                "skill_iteration_delta_after_last_skill_manage": "INTEGER NOT NULL DEFAULT 0",
+                "memory_tool_used": "INTEGER NOT NULL DEFAULT 0",
+                "skill_manage_used": "INTEGER NOT NULL DEFAULT 0",
+                "completed": "INTEGER NOT NULL DEFAULT 0",
+                "interrupted": "INTEGER NOT NULL DEFAULT 0",
+                "final_response_present": "INTEGER NOT NULL DEFAULT 0",
+                "gateway_session_key": "TEXT",
+                "cadence_scope_key": "TEXT",
+                "safe_review_context_json": "TEXT NOT NULL DEFAULT '{}'",
+            }.items():
+                if name not in candidate_columns:
+                    conn.execute(f"ALTER TABLE {candidates} ADD COLUMN {name} {ddl}")
+            work_columns = _columns(conn, "self_review_work_items")
+            for name, ddl in {
+                "review_kind": "TEXT",
+                "trigger_kind": "TEXT",
+                "action_categories_json": "TEXT NOT NULL DEFAULT '[]'",
+                "retryable": "INTEGER NOT NULL DEFAULT 1",
+                "side_effect_started_at": "DOUBLE PRECISION",
+                "manual_recovery_json": "TEXT",
+            }.items():
+                if name not in work_columns:
+                    conn.execute(f"ALTER TABLE {work_items} ADD COLUMN {name} {ddl}")
+            conn.execute(
+                f"INSERT INTO {state_meta}(key, value) VALUES(%s, %s) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (REVIEW_SCHEMA_META_KEY, REVIEW_SCHEMA_VERSION),
+            )
+
+        db._execute_write(_do_postgres)
+        return
+
     def _do(conn: sqlite3.Connection) -> None:
         conn.executescript(
             """
@@ -330,7 +549,9 @@ def apply_turn_review_candidate(
     db = _db(config)
 
     def _do(conn: sqlite3.Connection) -> Dict[str, Any]:
-        existing = conn.execute(
+        existing = _execute(
+            db,
+            conn,
             "SELECT candidate_id, status, snapshot_ref, snapshot_hash, snapshot_size FROM self_review_candidates WHERE execution_id=?",
             (obs.execution_id,),
         ).fetchone()
@@ -342,52 +563,105 @@ def apply_turn_review_candidate(
                 "snapshot_hash": existing["snapshot_hash"],
                 "snapshot_size": existing["snapshot_size"],
             }
-        conn.execute(
-            """
-            INSERT INTO self_review_candidates(
-                execution_id, agent_identity, status, created_at, updated_at,
-                candidate_owner_executor_instance_id, candidate_owner_generation,
-                memory_turn_delta, skill_iteration_delta, skill_iteration_delta_after_last_skill_manage,
-                memory_nudge_interval, skill_nudge_interval, memory_eligible, skill_eligible,
-                memory_tool_used, skill_manage_used, completed, interrupted, final_response_present,
-                gateway_session_key, cadence_scope_key,
-                observation_json, memory_target_json, skill_target_json, safe_review_context_json,
-                snapshot_ref, snapshot_path, snapshot_hash, snapshot_size
+        if _is_postgres_db(db):
+            inserted = _execute(
+                db,
+                conn,
+                """
+                INSERT INTO self_review_candidates(
+                    execution_id, agent_identity, status, created_at, updated_at,
+                    candidate_owner_executor_instance_id, candidate_owner_generation,
+                    memory_turn_delta, skill_iteration_delta, skill_iteration_delta_after_last_skill_manage,
+                    memory_nudge_interval, skill_nudge_interval, memory_eligible, skill_eligible,
+                    memory_tool_used, skill_manage_used, completed, interrupted, final_response_present,
+                    gateway_session_key, cadence_scope_key,
+                    observation_json, memory_target_json, skill_target_json, safe_review_context_json,
+                    snapshot_ref, snapshot_path, snapshot_hash, snapshot_size
+                )
+                VALUES (?, ?, 'candidate', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING candidate_id
+                """,
+                (
+                    obs.execution_id,
+                    obs.agent_identity,
+                    created,
+                    created,
+                    config.executor_instance_id,
+                    config.pod_generation,
+                    obs.memory_turn_delta,
+                    obs.skill_iteration_delta,
+                    obs.skill_iteration_delta_after_last_skill_manage,
+                    obs.memory_nudge_interval,
+                    obs.skill_nudge_interval,
+                    1 if obs.memory_eligible else 0,
+                    1 if obs.skill_eligible else 0,
+                    1 if obs.memory_tool_used else 0,
+                    1 if obs.skill_manage_used else 0,
+                    1 if obs.completed else 0,
+                    1 if obs.interrupted else 0,
+                    1 if obs.final_response_present else 0,
+                    obs.gateway_session_key,
+                    obs.cadence_scope_key,
+                    _json_dumps(obs.to_dict()),
+                    _json_dumps(obs.memory_target),
+                    _json_dumps(obs.skill_target),
+                    _json_dumps(obs.safe_review_context),
+                    snapshot_ref,
+                    str(snapshot_path),
+                    snapshot_hash,
+                    snapshot_size,
+                ),
+            ).fetchone()
+            candidate_id = int(_row_value(inserted, "candidate_id", 0))
+        else:
+            _execute(
+                db,
+                conn,
+                """
+                INSERT INTO self_review_candidates(
+                    execution_id, agent_identity, status, created_at, updated_at,
+                    candidate_owner_executor_instance_id, candidate_owner_generation,
+                    memory_turn_delta, skill_iteration_delta, skill_iteration_delta_after_last_skill_manage,
+                    memory_nudge_interval, skill_nudge_interval, memory_eligible, skill_eligible,
+                    memory_tool_used, skill_manage_used, completed, interrupted, final_response_present,
+                    gateway_session_key, cadence_scope_key,
+                    observation_json, memory_target_json, skill_target_json, safe_review_context_json,
+                    snapshot_ref, snapshot_path, snapshot_hash, snapshot_size
+                )
+                VALUES (?, ?, 'candidate', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    obs.execution_id,
+                    obs.agent_identity,
+                    created,
+                    created,
+                    config.executor_instance_id,
+                    config.pod_generation,
+                    obs.memory_turn_delta,
+                    obs.skill_iteration_delta,
+                    obs.skill_iteration_delta_after_last_skill_manage,
+                    obs.memory_nudge_interval,
+                    obs.skill_nudge_interval,
+                    1 if obs.memory_eligible else 0,
+                    1 if obs.skill_eligible else 0,
+                    1 if obs.memory_tool_used else 0,
+                    1 if obs.skill_manage_used else 0,
+                    1 if obs.completed else 0,
+                    1 if obs.interrupted else 0,
+                    1 if obs.final_response_present else 0,
+                    obs.gateway_session_key,
+                    obs.cadence_scope_key,
+                    _json_dumps(obs.to_dict()),
+                    _json_dumps(obs.memory_target),
+                    _json_dumps(obs.skill_target),
+                    _json_dumps(obs.safe_review_context),
+                    snapshot_ref,
+                    str(snapshot_path),
+                    snapshot_hash,
+                    snapshot_size,
+                ),
             )
-            VALUES (?, ?, 'candidate', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                obs.execution_id,
-                obs.agent_identity,
-                created,
-                created,
-                config.executor_instance_id,
-                config.pod_generation,
-                obs.memory_turn_delta,
-                obs.skill_iteration_delta,
-                obs.skill_iteration_delta_after_last_skill_manage,
-                obs.memory_nudge_interval,
-                obs.skill_nudge_interval,
-                1 if obs.memory_eligible else 0,
-                1 if obs.skill_eligible else 0,
-                1 if obs.memory_tool_used else 0,
-                1 if obs.skill_manage_used else 0,
-                1 if obs.completed else 0,
-                1 if obs.interrupted else 0,
-                1 if obs.final_response_present else 0,
-                obs.gateway_session_key,
-                obs.cadence_scope_key,
-                _json_dumps(obs.to_dict()),
-                _json_dumps(obs.memory_target),
-                _json_dumps(obs.skill_target),
-                _json_dumps(obs.safe_review_context),
-                snapshot_ref,
-                str(snapshot_path),
-                snapshot_hash,
-                snapshot_size,
-            ),
-        )
-        candidate_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            candidate_id = int(_execute(db, conn, "SELECT last_insert_rowid()").fetchone()[0])
         return {
             "candidate_id": candidate_id,
             "status": "candidate",
@@ -420,7 +694,9 @@ def mark_candidate_delivered(
     now = _now()
 
     def _do(conn: sqlite3.Connection) -> Dict[str, Any]:
-        row = conn.execute(
+        row = _execute(
+            db,
+            conn,
             "SELECT candidate_id, status, result_hash FROM self_review_candidates WHERE execution_id=?",
             (execution_id,),
         ).fetchone()
@@ -430,12 +706,16 @@ def mark_candidate_delivered(
             return {"candidate_id": row["candidate_id"], "status": row["status"]}
         existing_hash = _string(row["result_hash"])
         if existing_hash and existing_hash != result_hash:
-            conn.execute(
+            _execute(
+                db,
+                conn,
                 "UPDATE self_review_candidates SET status='delivery_ref_mismatch', updated_at=?, last_error=? WHERE candidate_id=?",
                 (now, "result hash mismatch for repeated delivery marker", row["candidate_id"]),
             )
             return {"candidate_id": row["candidate_id"], "status": "delivery_ref_mismatch"}
-        conn.execute(
+        _execute(
+            db,
+            conn,
             """
             UPDATE self_review_candidates
             SET status=CASE WHEN status='candidate' THEN 'validated' ELSE status END,
@@ -460,13 +740,17 @@ def mark_candidate_ineligible(config: SelfReviewConfig, execution_id: str, reaso
     now = _now()
 
     def _do(conn: sqlite3.Connection) -> Dict[str, Any]:
-        row = conn.execute(
+        row = _execute(
+            db,
+            conn,
             "SELECT candidate_id FROM self_review_candidates WHERE execution_id=?",
             (execution_id,),
         ).fetchone()
         if not row:
             return {"status": "missing", "execution_id": execution_id}
-        conn.execute(
+        _execute(
+            db,
+            conn,
             "UPDATE self_review_candidates SET status='ineligible', updated_at=?, last_error=? WHERE candidate_id=?",
             (now, reason[:800], row["candidate_id"]),
         )
@@ -477,8 +761,10 @@ def mark_candidate_ineligible(config: SelfReviewConfig, execution_id: str, reaso
     return result
 
 
-def _earliest_promotable(conn: sqlite3.Connection, agent_identity: str) -> Optional[sqlite3.Row]:
-    return conn.execute(
+def _earliest_promotable(db: Any, conn: sqlite3.Connection, agent_identity: str) -> Optional[sqlite3.Row]:
+    return _execute(
+        db,
+        conn,
         """
         SELECT * FROM self_review_candidates
         WHERE agent_identity=?
@@ -497,7 +783,7 @@ def promote_review_candidate(config: SelfReviewConfig, candidate_id: int) -> Dic
     now = _now()
 
     def _do(conn: sqlite3.Connection) -> Dict[str, Any]:
-        row = conn.execute("SELECT * FROM self_review_candidates WHERE candidate_id=?", (candidate_id,)).fetchone()
+        row = _execute(db, conn, "SELECT * FROM self_review_candidates WHERE candidate_id=?", (candidate_id,)).fetchone()
         if not row:
             return {"status": "missing", "candidate_id": candidate_id}
         if row["status"] == "enqueued":
@@ -512,14 +798,18 @@ def promote_review_candidate(config: SelfReviewConfig, candidate_id: int) -> Dic
         final_response_present = bool(int(row["final_response_present"] or 0) or observation_payload.get("final_response_present"))
         if not completed or interrupted or not final_response_present:
             reason = "observation_end_state_ineligible"
-            conn.execute(
+            _execute(
+                db,
+                conn,
                 "UPDATE self_review_candidates SET status='ineligible', updated_at=?, last_error=? WHERE candidate_id=?",
                 (now, reason, candidate_id),
             )
             return {"status": "ineligible", "candidate_id": candidate_id, "reason": reason}
-        earliest = _earliest_promotable(conn, row["agent_identity"])
+        earliest = _earliest_promotable(db, conn, row["agent_identity"])
         if earliest and int(earliest["candidate_id"]) != int(candidate_id):
-            conn.execute(
+            _execute(
+                db,
+                conn,
                 "UPDATE self_review_candidates SET status='pending_promote_retry', updated_at=? WHERE candidate_id=?",
                 (now, candidate_id),
             )
@@ -536,7 +826,9 @@ def promote_review_candidate(config: SelfReviewConfig, candidate_id: int) -> Dic
             or _string(row["execution_id"])
             or _string(row["agent_identity"])
         )
-        counters = conn.execute(
+        counters = _execute(
+            db,
+            conn,
             "SELECT memory_turns, skill_iterations FROM self_review_cadence_counters WHERE cadence_scope_key=?",
             (cadence_scope_key,),
         ).fetchone()
@@ -560,7 +852,9 @@ def promote_review_candidate(config: SelfReviewConfig, candidate_id: int) -> Dic
             memory_turns = 0
         if review_skills:
             skill_iterations = 0
-        conn.execute(
+        _execute(
+            db,
+            conn,
             """
             INSERT INTO self_review_cadence_counters(cadence_scope_key, agent_identity, memory_turns, skill_iterations, updated_at)
             VALUES (?, ?, ?, ?, ?)
@@ -572,7 +866,9 @@ def promote_review_candidate(config: SelfReviewConfig, candidate_id: int) -> Dic
             """,
             (cadence_scope_key, row["agent_identity"], memory_turns, skill_iterations, now),
         )
-        conn.execute(
+        _execute(
+            db,
+            conn,
             """
             INSERT INTO self_review_counters(agent_identity, memory_turns, skill_iterations, updated_at)
             VALUES (?, ?, ?, ?)
@@ -592,13 +888,16 @@ def promote_review_candidate(config: SelfReviewConfig, candidate_id: int) -> Dic
         for kind, should_create, trigger_kind in work_plan:
             if not should_create:
                 continue
-            conn.execute(
+            _execute(
+                db,
+                conn,
                 """
-                INSERT OR IGNORE INTO self_review_work_items(
+                INSERT INTO self_review_work_items(
                     candidate_id, execution_id, agent_identity, kind, status,
                     created_at, updated_at, review_kind, trigger_kind
                 )
                 VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                ON CONFLICT(candidate_id, kind) DO NOTHING
                 """,
                 (row["candidate_id"], row["execution_id"], row["agent_identity"], kind, now, now, kind, trigger_kind),
             )
@@ -611,7 +910,9 @@ def promote_review_candidate(config: SelfReviewConfig, candidate_id: int) -> Dic
             "cadence_scope_key": cadence_scope_key,
             "work_created": work_created,
         }
-        conn.execute(
+        _execute(
+            db,
+            conn,
             """
             UPDATE self_review_candidates
             SET status=?, updated_at=?, promoted_at=?, promotion_attempts=promotion_attempts + 1,
@@ -627,29 +928,40 @@ def promote_review_candidate(config: SelfReviewConfig, candidate_id: int) -> Dic
     return result
 
 
-def _status_counts(conn: sqlite3.Connection, config: SelfReviewConfig, stale_recovered: int) -> Dict[str, Any]:
-    candidate_rows = conn.execute("SELECT status, COUNT(*) AS c FROM self_review_candidates GROUP BY status").fetchall()
-    work_rows = conn.execute("SELECT kind, status, COUNT(*) AS c FROM self_review_work_items GROUP BY kind, status").fetchall()
-    promotable = conn.execute(
+def _status_counts(db: Any, conn: sqlite3.Connection, config: SelfReviewConfig, stale_recovered: int) -> Dict[str, Any]:
+    candidate_rows = _execute(db, conn, "SELECT status, COUNT(*) AS c FROM self_review_candidates GROUP BY status").fetchall()
+    work_rows = _execute(db, conn, "SELECT kind, status, COUNT(*) AS c FROM self_review_work_items GROUP BY kind, status").fetchall()
+    promotable_row = _execute(
+        db,
+        conn,
         """
-        SELECT COUNT(*) FROM self_review_candidates
+        SELECT COUNT(*) AS c FROM self_review_candidates
         WHERE status IN ('validated', 'pending_promote_retry')
           AND native_envelope_validated_at IS NOT NULL
           AND delivered_at IS NOT NULL
         """
-    ).fetchone()[0]
+    ).fetchone()
+    promotable = int(_row_value(promotable_row, "c", 0, 0) or 0)
     blocking_placeholders = ",".join("?" for _ in BLOCKING_WORK_STATUSES)
-    pending_running = conn.execute(
-        f"SELECT COUNT(*) FROM self_review_work_items WHERE status IN ({blocking_placeholders})",
+    pending_running_row = _execute(
+        db,
+        conn,
+        f"SELECT COUNT(*) AS c FROM self_review_work_items WHERE status IN ({blocking_placeholders})",
         tuple(BLOCKING_WORK_STATUSES),
-    ).fetchone()[0]
-    skill_blocking = conn.execute(
-        f"SELECT COUNT(*) FROM self_review_work_items WHERE kind IN ('skill', 'combined') AND status IN ({blocking_placeholders})",
+    ).fetchone()
+    pending_running = int(_row_value(pending_running_row, "c", 0, 0) or 0)
+    skill_blocking_row = _execute(
+        db,
+        conn,
+        f"SELECT COUNT(*) AS c FROM self_review_work_items WHERE kind IN ('skill', 'combined') AND status IN ({blocking_placeholders})",
         tuple(BLOCKING_WORK_STATUSES),
-    ).fetchone()[0]
-    local_owned_pending = conn.execute(
+    ).fetchone()
+    skill_blocking = int(_row_value(skill_blocking_row, "c", 0, 0) or 0)
+    local_owned_pending_row = _execute(
+        db,
+        conn,
         """
-        SELECT COUNT(*) FROM self_review_work_items w
+        SELECT COUNT(*) AS c FROM self_review_work_items w
         JOIN self_review_candidates c ON c.candidate_id=w.candidate_id
         WHERE w.status IN ('pending', 'interrupted', 'blocked_after_side_effect_start')
           AND (
@@ -663,19 +975,25 @@ def _status_counts(conn: sqlite3.Connection, config: SelfReviewConfig, stale_rec
             config.executor_instance_id,
             config.pod_generation,
         ),
-    ).fetchone()[0]
-    local_running = conn.execute(
+    ).fetchone()
+    local_owned_pending = int(_row_value(local_owned_pending_row, "c", 0, 0) or 0)
+    local_running_row = _execute(
+        db,
+        conn,
         """
-        SELECT COUNT(*) FROM self_review_work_items
+        SELECT COUNT(*) AS c FROM self_review_work_items
         WHERE status='running'
           AND review_owner_executor_instance_id=?
           AND review_owner_generation=?
         """,
         (config.executor_instance_id, config.pod_generation),
-    ).fetchone()[0]
-    local_promotable = conn.execute(
+    ).fetchone()
+    local_running = int(_row_value(local_running_row, "c", 0, 0) or 0)
+    local_promotable_row = _execute(
+        db,
+        conn,
         """
-        SELECT COUNT(*) FROM self_review_candidates
+        SELECT COUNT(*) AS c FROM self_review_candidates
         WHERE status IN ('validated', 'pending_promote_retry')
           AND native_envelope_validated_at IS NOT NULL
           AND delivered_at IS NOT NULL
@@ -683,7 +1001,8 @@ def _status_counts(conn: sqlite3.Connection, config: SelfReviewConfig, stale_rec
           AND candidate_owner_generation=?
         """,
         (config.executor_instance_id, config.pod_generation),
-    ).fetchone()[0]
+    ).fetchone()
+    local_promotable = int(_row_value(local_promotable_row, "c", 0, 0) or 0)
     return {
         "ok": promotable == 0 and pending_running == 0,
         "promotable_candidate_count": int(promotable),
@@ -698,9 +1017,11 @@ def _status_counts(conn: sqlite3.Connection, config: SelfReviewConfig, stale_rec
     }
 
 
-def _reconcile_stale(conn: sqlite3.Connection, config: SelfReviewConfig, now: float) -> int:
+def _reconcile_stale(db: Any, conn: sqlite3.Connection, config: SelfReviewConfig, now: float) -> int:
     cutoff = now - max(1.0, float(config.stale_after_seconds))
-    blocked = conn.execute(
+    blocked = _execute(
+        db,
+        conn,
         """
         UPDATE self_review_work_items
         SET status='blocked_after_side_effect_start', retryable=0, updated_at=?,
@@ -711,7 +1032,9 @@ def _reconcile_stale(conn: sqlite3.Connection, config: SelfReviewConfig, now: fl
         """,
         (now, cutoff),
     )
-    cur = conn.execute(
+    cur = _execute(
+        db,
+        conn,
         """
         UPDATE self_review_work_items
         SET status='interrupted', updated_at=?, last_error='stale lease recovered'
@@ -729,7 +1052,9 @@ def _force_recover_running(config: SelfReviewConfig) -> int:
     now = _now()
 
     def _do(conn: sqlite3.Connection) -> int:
-        blocked = conn.execute(
+        blocked = _execute(
+            db,
+            conn,
             """
             UPDATE self_review_work_items
             SET status='blocked_after_side_effect_start', retryable=0, updated_at=?,
@@ -739,7 +1064,9 @@ def _force_recover_running(config: SelfReviewConfig) -> int:
             """,
             (now,),
         )
-        cur = conn.execute(
+        cur = _execute(
+            db,
+            conn,
             """
             UPDATE self_review_work_items
             SET status='interrupted', updated_at=?, last_error='dead generation recovered by deployment drain'
@@ -760,13 +1087,12 @@ def review_queue_status(config: SelfReviewConfig, reconcile_stale: bool = True) 
     now = _now()
     if reconcile_stale:
         def _do(conn: sqlite3.Connection) -> Dict[str, Any]:
-            stale_recovered = _reconcile_stale(conn, config, now)
-            return _status_counts(conn, config, stale_recovered)
+            stale_recovered = _reconcile_stale(db, conn, config, now)
+            return _status_counts(db, conn, config, stale_recovered)
 
         result = db._execute_write(_do)
     else:
-        with db._lock:
-            result = _status_counts(db._conn, config, 0)
+        result = _execute_read(db, lambda conn: _status_counts(db, conn, config, 0))
     db.close()
     return result
 
@@ -774,11 +1100,13 @@ def review_queue_status(config: SelfReviewConfig, reconcile_stale: bool = True) 
 def candidate_status(config: SelfReviewConfig, execution_id: str) -> Dict[str, Any]:
     db = _db(config)
     try:
-        with db._lock:
-            row = db._conn.execute("SELECT * FROM self_review_candidates WHERE execution_id=?", (execution_id,)).fetchone()
+        def _read(conn: sqlite3.Connection) -> tuple[Any, List[Any]]:
+            row = _execute(db, conn, "SELECT * FROM self_review_candidates WHERE execution_id=?", (execution_id,)).fetchone()
             if not row:
-                return {}
-            work = db._conn.execute(
+                return None, []
+            work = _execute(
+                db,
+                conn,
                 """
                 SELECT kind, status, result_summary, last_error, review_kind, trigger_kind,
                        action_categories_json, retryable, side_effect_started_at, manual_recovery_json
@@ -786,6 +1114,11 @@ def candidate_status(config: SelfReviewConfig, execution_id: str) -> Dict[str, A
                 """,
                 (row["candidate_id"],),
             ).fetchall()
+            return row, list(work)
+
+        row, work = _execute_read(db, _read)
+        if not row:
+            return {}
     finally:
         db.close()
     return {
@@ -839,7 +1172,7 @@ def recover_blocked_work(
     now = _now()
 
     def _do(conn: sqlite3.Connection) -> Dict[str, Any]:
-        row = conn.execute("SELECT work_id, status FROM self_review_work_items WHERE work_id=?", (work_id,)).fetchone()
+        row = _execute(db, conn, "SELECT work_id, status FROM self_review_work_items WHERE work_id=?", (work_id,)).fetchone()
         if not row:
             return {"status": "missing", "work_id": work_id}
         previous_status = row["status"]
@@ -852,7 +1185,9 @@ def recover_blocked_work(
             "resulting_status": target_status,
             "action": action,
         }
-        conn.execute(
+        _execute(
+            db,
+            conn,
             """
             UPDATE self_review_work_items
             SET status=?, retryable=?, updated_at=?, last_progress_at=?,
@@ -905,7 +1240,9 @@ def _mark_work(
             retryable_clause = ", retryable=?"
             params.append(1 if retryable else 0)
         params.append(work_id)
-        conn.execute(
+        _execute(
+            db,
+            conn,
             """
             UPDATE self_review_work_items
             SET status=?, updated_at=?, last_progress_at=?, result_summary=?,
@@ -925,7 +1262,9 @@ def _mark_side_effect_started(config: SelfReviewConfig, work_id: int) -> None:
     now = _now()
 
     def _do(conn: sqlite3.Connection) -> None:
-        conn.execute(
+        _execute(
+            db,
+            conn,
             """
             UPDATE self_review_work_items
             SET side_effect_started_at=COALESCE(side_effect_started_at, ?),
@@ -944,7 +1283,9 @@ def run_memory_self_review(config: SelfReviewConfig, candidate_id: int) -> Dict[
     now = _now()
 
     def _claim(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:
-        row = conn.execute(
+        row = _execute(
+            db,
+            conn,
             """
             SELECT w.*, c.snapshot_path, c.observation_json FROM self_review_work_items w
             JOIN self_review_candidates c ON c.candidate_id=w.candidate_id
@@ -955,7 +1296,9 @@ def run_memory_self_review(config: SelfReviewConfig, candidate_id: int) -> Dict[
         ).fetchone()
         if not row:
             return None
-        conn.execute(
+        _execute(
+            db,
+            conn,
             """
             UPDATE self_review_work_items
             SET status='running', updated_at=?, lease_heartbeat_at=?, last_progress_at=?,
@@ -1012,7 +1355,9 @@ def _claim_skill_batch(config: SelfReviewConfig, *, local_only: bool = False) ->
         if local_only:
             owner_clause = " AND c.candidate_owner_executor_instance_id=? AND c.candidate_owner_generation=?"
             params.extend([config.executor_instance_id, config.pod_generation])
-        candidate_rows = conn.execute(
+        candidate_rows = _execute(
+            db,
+            conn,
             f"""
             SELECT w.*, c.snapshot_path, c.observation_json, c.snapshot_size FROM self_review_work_items w
             JOIN self_review_candidates c ON c.candidate_id=w.candidate_id
@@ -1035,7 +1380,9 @@ def _claim_skill_batch(config: SelfReviewConfig, *, local_only: bool = False) ->
             estimated_tokens += row_tokens
             break
         for row in rows:
-            conn.execute(
+            _execute(
+                db,
+                conn,
                 """
                 UPDATE self_review_work_items
                 SET status='running', updated_at=?, lease_heartbeat_at=?, last_progress_at=?,
@@ -1260,25 +1607,31 @@ def advance_local_review_queue(config: SelfReviewConfig) -> Dict[str, Any]:
 
 def _promote_next(config: SelfReviewConfig, *, local_only: bool = False) -> Dict[str, Any]:
     db = _db(config)
-    with db._lock:
+    try:
         owner_clause = ""
         params: List[Any] = []
         if local_only:
             owner_clause = " AND candidate_owner_executor_instance_id=? AND candidate_owner_generation=?"
             params.extend([config.executor_instance_id, config.pod_generation])
-        row = db._conn.execute(
-            f"""
-            SELECT candidate_id FROM self_review_candidates
-            WHERE status IN ('validated', 'pending_promote_retry')
-              AND native_envelope_validated_at IS NOT NULL
-              AND delivered_at IS NOT NULL
-              {owner_clause}
-            ORDER BY agent_identity, created_at, candidate_id
-            LIMIT 1
-            """,
-            params,
-        ).fetchone()
-    db.close()
+        row = _execute_read(
+            db,
+            lambda conn: _execute(
+                db,
+                conn,
+                f"""
+                SELECT candidate_id FROM self_review_candidates
+                WHERE status IN ('validated', 'pending_promote_retry')
+                  AND native_envelope_validated_at IS NOT NULL
+                  AND delivered_at IS NOT NULL
+                  {owner_clause}
+                ORDER BY agent_identity, created_at, candidate_id
+                LIMIT 1
+                """,
+                params,
+            ).fetchone(),
+        )
+    finally:
+        db.close()
     if row:
         return promote_review_candidate(config, int(row["candidate_id"]))
     return {"status": "skipped", "reason": "no_promotable_candidate"}
@@ -1286,7 +1639,7 @@ def _promote_next(config: SelfReviewConfig, *, local_only: bool = False) -> Dict
 
 def _run_next_work(config: SelfReviewConfig, *, local_only: bool = False) -> Dict[str, Any]:
     db = _db(config)
-    with db._lock:
+    try:
         owner_clause = ""
         params: List[Any] = []
         if local_only:
@@ -1295,18 +1648,24 @@ def _run_next_work(config: SelfReviewConfig, *, local_only: bool = False) -> Dic
                 "OR c.candidate_owner_executor_instance_id=? AND c.candidate_owner_generation=?)"
             )
             params.extend([config.executor_instance_id, config.pod_generation, config.executor_instance_id, config.pod_generation])
-        row = db._conn.execute(
-            f"""
-            SELECT w.candidate_id, w.kind FROM self_review_work_items w
-            JOIN self_review_candidates c ON c.candidate_id=w.candidate_id
-            WHERE w.status IN ('pending', 'interrupted')
-              {owner_clause}
-            ORDER BY w.created_at, w.work_id
-            LIMIT 1
-            """,
-            params,
-        ).fetchone()
-    db.close()
+        row = _execute_read(
+            db,
+            lambda conn: _execute(
+                db,
+                conn,
+                f"""
+                SELECT w.candidate_id, w.kind FROM self_review_work_items w
+                JOIN self_review_candidates c ON c.candidate_id=w.candidate_id
+                WHERE w.status IN ('pending', 'interrupted')
+                  {owner_clause}
+                ORDER BY w.created_at, w.work_id
+                LIMIT 1
+                """,
+                params,
+            ).fetchone(),
+        )
+    finally:
+        db.close()
     if not row:
         return {"status": "skipped", "reason": "no_pending_work"}
     if row["kind"] in {"memory", "combined"}:
