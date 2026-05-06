@@ -2,13 +2,14 @@
 """
 Session Search Tool - Long-Term Conversation Recall
 
-Searches past session transcripts in SQLite via FTS5, then summarizes the top
+Searches past session transcripts via the configured state DB search backend,
+then summarizes the top
 matching sessions using a cheap/fast model (same pattern as web_extract).
 Returns focused summaries of past conversations rather than raw transcripts,
 keeping the main model's context window clean.
 
 Flow:
-  1. FTS5 search finds matching messages ranked by relevance
+  1. State DB search finds matching messages ranked by relevance
   2. Groups by session, takes the top N unique sessions (default 3)
   3. Loads each session's conversation, truncates to ~100k chars centered on matches
   4. Sends to Gemini Flash with a focused summarization prompt
@@ -330,7 +331,8 @@ def session_search(
     """
     Search past sessions and return focused summaries of matching conversations.
 
-    Uses FTS5 to find matches, then summarizes the top sessions with Gemini Flash.
+    Uses the state DB search backend to find matches, then summarizes the top
+    sessions with Gemini Flash.
     The current session is excluded from results since the agent already has that context.
     """
     if db is None:
@@ -359,7 +361,7 @@ def session_search(
         if role_filter and role_filter.strip():
             role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
 
-        # FTS5 search -- get matches ranked by relevance
+        # State DB search -- get matches ranked by relevance
         raw_results = db.search_messages(
             query=query,
             role_filter=role_list,
@@ -522,7 +524,7 @@ def session_search(
 
 
 def check_session_search_requirements() -> bool:
-    """Requires SQLite state database and an auxiliary text model."""
+    """Requires an initialized state database and an auxiliary text model."""
     try:
         from hermes_state import DEFAULT_DB_PATH
         return DEFAULT_DB_PATH.parent.exists()
@@ -551,7 +553,8 @@ SESSION_SEARCH_SCHEMA = {
         "Better to search and confirm than to guess or ask the user to repeat themselves.\n\n"
         "Search syntax: keywords joined with OR for broad recall (elevenlabs OR baseten OR funding), "
         "phrases for exact match (\"docker networking\"), boolean (python NOT java), prefix (deploy*). "
-        "IMPORTANT: Use OR between keywords for best results — FTS5 defaults to AND which misses "
+        "IMPORTANT: Use OR between keywords for broad recall; lexical search treats adjacent "
+        "keywords as a narrow match, which can miss "
         "sessions that only mention some terms. If a broad OR query returns nothing, try individual "
         "keyword searches in parallel. Returns summaries of the top matching sessions."
     ),
