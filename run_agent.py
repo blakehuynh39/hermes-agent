@@ -70,6 +70,7 @@ from pathlib import Path
 
 from hermes_constants import get_hermes_home
 from self_review_contracts import SelfReviewObservationV1
+from tools.external_tool_pause import ExternalToolPending
 
 
 _OPENAI_CLS_CACHE: Optional[type] = None
@@ -396,6 +397,12 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
         return False
 
     tool_names = [tc.function.name for tc in tool_calls]
+    try:
+        from tools.registry import registry
+        if any(registry.is_external_pause_tool(name) for name in tool_names):
+            return False
+    except Exception:
+        pass
     if any(name in _NEVER_PARALLEL_TOOLS for name in tool_names):
         return False
 
@@ -6264,6 +6271,79 @@ class AIAgent:
         fn = getattr(tc, "function", None)
         return getattr(fn, "name", "") or ""
 
+    @staticmethod
+    def _find_unanswered_tool_call(messages: List[Dict[str, Any]], tool_call_id: str, tool_name: str = "") -> Optional[Dict[str, Any]]:
+        """Find an assistant tool call that has not yet received a tool result."""
+        if not tool_call_id:
+            return None
+        answered_ids = {
+            msg.get("tool_call_id")
+            for msg in messages
+            if isinstance(msg, dict) and msg.get("role") == "tool" and msg.get("tool_call_id")
+        }
+        if tool_call_id in answered_ids:
+            return None
+        for msg in reversed(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                if AIAgent._get_tool_call_id_static(tc) != tool_call_id:
+                    continue
+                actual_name = AIAgent._get_tool_call_name_static(tc)
+                if tool_name and actual_name != tool_name:
+                    return None
+                return {"assistant_message": msg, "tool_call": tc, "tool_name": actual_name}
+        return None
+
+    def _append_external_tool_resume_result(self, messages: List[Dict[str, Any]], resume_tool_result: Dict[str, Any]) -> None:
+        """Append one externally supplied tool result after validating lineage."""
+        tool_call_id = str(resume_tool_result.get("tool_call_id") or "").strip()
+        tool_name = str(resume_tool_result.get("tool_name") or "").strip()
+        content = resume_tool_result.get("content")
+        if not isinstance(content, str):
+            content = json.dumps(content if content is not None else {}, ensure_ascii=False, sort_keys=True)
+        match = self._find_unanswered_tool_call(messages, tool_call_id, tool_name)
+        if match is None:
+            raise ValueError(
+                f"Cannot resume external tool result: unanswered tool call not found "
+                f"or already answered (tool_call_id={tool_call_id!r}, tool_name={tool_name!r})"
+            )
+        messages.append({
+            "role": "tool",
+            "name": tool_name or str(match.get("tool_name") or ""),
+            "content": content,
+            "tool_call_id": tool_call_id,
+        })
+
+    def resume_with_tool_result(
+        self,
+        *,
+        session_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        content: str,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        system_message: str = None,
+        task_id: str = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Continue a session by satisfying a pending external tool call."""
+        if session_id and self.session_id != session_id:
+            raise ValueError(f"resume session mismatch: agent={self.session_id!r} payload={session_id!r}")
+        payload = {
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "content": content,
+            "metadata": metadata or {},
+        }
+        return self.run_conversation(
+            "",
+            system_message=system_message,
+            conversation_history=conversation_history,
+            task_id=task_id or session_id or self.session_id,
+            resume_tool_result=payload,
+        )
+
     _VALID_API_ROLES = frozenset({"system", "user", "assistant", "tool", "function", "developer"})
 
     @staticmethod
@@ -11021,6 +11101,8 @@ class AIAgent:
                     messages=messages,
                     pre_tool_block_checked=True,
                 )
+            except ExternalToolPending:
+                raise
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -11487,6 +11569,8 @@ class AIAgent:
                 try:
                     function_result = self.context_compressor.handle_tool_call(function_name, function_args, messages=messages)
                     _ce_result = function_result
+                except ExternalToolPending:
+                    raise
                 except Exception as tool_error:
                     function_result = json.dumps({"error": f"Context engine tool '{function_name}' failed: {tool_error}"})
                     logger.error("context_engine.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -11511,6 +11595,8 @@ class AIAgent:
                 try:
                     function_result = self._memory_manager.handle_tool_call(function_name, function_args)
                     _mem_result = function_result
+                except ExternalToolPending:
+                    raise
                 except Exception as tool_error:
                     function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
                     logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -11539,6 +11625,8 @@ class AIAgent:
                         skip_pre_tool_call_hook=True,
                     )
                     _spinner_result = function_result
+                except ExternalToolPending:
+                    raise
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -11558,6 +11646,8 @@ class AIAgent:
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
                     )
+                except ExternalToolPending:
+                    raise
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -11923,6 +12013,7 @@ class AIAgent:
         task_id: str = None,
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
+        resume_tool_result: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run a complete conversation with tool calling until completion.
@@ -11938,6 +12029,9 @@ class AIAgent:
             persist_user_message: Optional clean user message to store in
                 transcripts/history when user_message contains API-only
                 synthetic prefixes.
+            resume_tool_result: Optional externally approved tool result to
+                append for a previously unanswered tool_call_id without
+                creating a new user turn.
                     or queuing follow-up prefetch work.
 
         Returns:
@@ -12047,6 +12141,8 @@ class AIAgent:
         # calls so that nudge logic accumulates correctly in CLI mode.
         self.iteration_budget = IterationBudget(self.max_iterations)
 
+        resume_mode = isinstance(resume_tool_result, dict)
+
         # Log conversation turn start for debugging/observability
         _preview_text = _summarize_user_message_for_log(user_message)
         _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
@@ -12094,8 +12190,10 @@ class AIAgent:
         # be saved to session DB, session logs, or batch trajectories, but they're
         # automatically re-applied on every API call (including session continuations).
         
-        # Track user turns for memory flush and periodic nudge logic
-        self._user_turn_count += 1
+        # Track user turns for memory flush and periodic nudge logic. External
+        # tool resume is a continuation of the prior turn, not a new user turn.
+        if not resume_mode:
+            self._user_turn_count += 1
 
         # Reset the streaming context scrubber at the top of each turn so a
         # hung span from a prior interrupted stream can't taint this turn's
@@ -12110,7 +12208,7 @@ class AIAgent:
             think_scrubber.reset()
 
         # Preserve the original user message (no nudge injection).
-        original_user_message = persist_user_message if persist_user_message is not None else user_message
+        original_user_message = "" if resume_mode else (persist_user_message if persist_user_message is not None else user_message)
 
         # Track memory nudge trigger (turn-based, checked here).
         # Skill trigger is checked AFTER the agent loop completes, based on
@@ -12123,7 +12221,8 @@ class AIAgent:
         _memory_tool_used = False
         _skill_manage_used = False
         _should_review_memory = False
-        if (self._memory_nudge_interval > 0
+        if (not resume_mode
+                and self._memory_nudge_interval > 0
                 and "memory" in self.valid_tool_names
                 and self._memory_store):
             _memory_turn_delta = 1
@@ -12133,13 +12232,18 @@ class AIAgent:
                     _should_review_memory = True
                     self._turns_since_memory = 0
 
-        # Add user message
-        user_msg = {"role": "user", "content": user_message}
-        messages.append(user_msg)
-        current_turn_user_idx = len(messages) - 1
-        self._persist_user_message_idx = current_turn_user_idx
-        
-        if not self.quiet_mode:
+        if resume_mode:
+            self._append_external_tool_resume_result(messages, resume_tool_result or {})
+            current_turn_user_idx = None
+            self._persist_user_message_idx = None
+        else:
+            # Add user message
+            user_msg = {"role": "user", "content": user_message}
+            messages.append(user_msg)
+            current_turn_user_idx = len(messages) - 1
+            self._persist_user_message_idx = current_turn_user_idx
+
+        if not self.quiet_mode and not resume_mode:
             _print_preview = _summarize_user_message_for_log(user_message)
             self._safe_print(f"💬 Starting conversation: '{_print_preview[:60]}{'...' if len(_print_preview) > 60 else ''}'")
         
@@ -12278,16 +12382,16 @@ class AIAgent:
         _plugin_user_context = ""
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _pre_results = _invoke_hook(
-                "pre_llm_call",
-                session_id=self.session_id,
-                user_message=original_user_message,
-                conversation_history=list(messages),
-                is_first_turn=(not bool(conversation_history)),
-                model=self.model,
-                platform=getattr(self, "platform", None) or "",
-                sender_id=getattr(self, "_user_id", None) or "",
-            )
+            _pre_results = [] if resume_mode else _invoke_hook(
+                    "pre_llm_call",
+                    session_id=self.session_id,
+                    user_message=original_user_message,
+                    conversation_history=list(messages),
+                    is_first_turn=(not bool(conversation_history)),
+                    model=self.model,
+                    platform=getattr(self, "platform", None) or "",
+                    sender_id=getattr(self, "_user_id", None) or "",
+                )
             _ctx_parts: list[str] = []
             for r in _pre_results:
                 if isinstance(r, dict) and r.get("context"):
@@ -12317,6 +12421,7 @@ class AIAgent:
         # present are surfaced in an advisory footer so the model cannot
         # over-claim success while the file is actually unchanged on disk.
         self._turn_failed_file_mutations: Dict[str, Dict[str, Any]] = {}
+        external_tool_pending_payload = None
         
         # Record the execution thread so interrupt()/clear_interrupt() can
         # scope the tool-level interrupt signal to THIS agent's thread only.
@@ -15056,7 +15161,14 @@ class AIAgent:
                         except Exception:
                             pass
 
-                    self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                    try:
+                        self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                    except ExternalToolPending as pending:
+                        external_tool_pending_payload = pending.to_dict(session_id=self.session_id)
+                        _turn_exit_reason = "external_tool_pending"
+                        if not self.quiet_mode:
+                            self._safe_print("⏸ External tool call pending approval/result")
+                        break
 
                     if self._tool_guardrail_halt_decision is not None:
                         decision = self._tool_guardrail_halt_decision
@@ -15470,6 +15582,12 @@ class AIAgent:
                         self._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                     break
                 
+            except ExternalToolPending as pending:
+                external_tool_pending_payload = pending.to_dict(session_id=self.session_id)
+                _turn_exit_reason = "external_tool_pending"
+                if not self.quiet_mode:
+                    self._safe_print("⏸ External tool call pending approval/result")
+                break
             except Exception as e:
                 error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
                 try:
@@ -15746,6 +15864,17 @@ class AIAgent:
         }
         if self._tool_guardrail_halt_decision is not None:
             result["guardrail"] = self._tool_guardrail_halt_decision.to_metadata()
+        if external_tool_pending_payload is not None:
+            result["external_tool_pending"] = external_tool_pending_payload
+            result["termination_reason"] = "external_tool_pending"
+            result["completion_verdict"] = "paused"
+            result["suppress_delivery"] = True
+            result["external_tool_pause_id"] = (
+                external_tool_pending_payload.get("external_tool_pause_id")
+                or external_tool_pending_payload.get("external_action_id")
+                or external_tool_pending_payload.get("pause_id")
+                or ""
+            )
         # If a /steer landed after the final assistant turn (no more tool
         # batches to drain into), hand it back to the caller so it can be
         # delivered as the next user turn instead of being silently lost.
