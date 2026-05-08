@@ -22,6 +22,7 @@ import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from tools.external_tool_pause import ExternalToolPending
 
 
 # ---------------------------------------------------------------------------
@@ -1793,6 +1794,57 @@ class TestFormatToolsForSystemMessage:
 
 
 class TestExecuteToolCalls:
+    def test_external_pause_tool_batch_collapses_to_single_call(self, agent):
+        tc1 = _mock_tool_call(name="web_search", arguments='{"q":"alpha"}', call_id="c1")
+        tc2 = _mock_tool_call(name="db_read_query", arguments='{"sql":"select 1"}', call_id="c2")
+
+        with patch("tools.registry.registry.is_external_pause_tool", side_effect=lambda name: name == "db_read_query"):
+            collapsed = run_agent._collapse_external_pause_tool_batch([tc1, tc2])
+
+        assert collapsed == [tc2]
+
+    def test_external_pause_tool_batch_persists_singleton_assistant_message(self, agent):
+        agent.valid_tool_names.add("db_read_query")
+        tc1 = _mock_tool_call(name="web_search", arguments='{"q":"alpha"}', call_id="c1")
+        tc2 = _mock_tool_call(name="db_read_query", arguments='{"sql":"select 1"}', call_id="c2")
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[tc1, tc2],
+        )
+
+        def fake_handle(name, args, task_id, **kwargs):
+            if name == "db_read_query":
+                raise ExternalToolPending(
+                    {
+                        "external_tool_pause_id": "etpause_1",
+                        "tool_call_id": kwargs.get("tool_call_id"),
+                        "tool_name": name,
+                    }
+                )
+            return "should not run"
+
+        with (
+            patch("tools.registry.registry.is_external_pause_tool", side_effect=lambda name: name == "db_read_query"),
+            patch("run_agent.handle_function_call", side_effect=fake_handle),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("run a db query and search")
+
+        assistant_tool_messages = [
+            msg for msg in result["messages"]
+            if msg.get("role") == "assistant" and msg.get("tool_calls")
+        ]
+        assert len(assistant_tool_messages) == 1
+        tool_calls = assistant_tool_messages[0]["tool_calls"]
+        assert len(tool_calls) == 1
+        assert tool_calls[0]["id"] == "c2"
+        assert result["termination_reason"] == "external_tool_pending"
+        assert result["external_tool_pause_id"] == "etpause_1"
+        assert not any(msg.get("role") == "tool" and msg.get("tool_call_id") == "c1" for msg in result["messages"])
+
     def test_single_tool_executed(self, agent):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
@@ -2363,6 +2415,18 @@ class TestParallelScopePathNormalization:
         tc2 = _mock_tool_call(name="write_file", arguments=f'{{"path":"{tmp_path / "notes.txt"}","content":"two"}}', call_id="c2")
 
         assert not _should_parallelize_tool_batch([tc1, tc2])
+
+    def test_should_parallelize_tool_batch_rejects_external_pause_tools(self):
+        from run_agent import _should_parallelize_tool_batch
+
+        tc1 = _mock_tool_call(name="web_search", arguments='{"q":"alpha"}', call_id="c1")
+        tc2 = _mock_tool_call(name="db_read_query", arguments='{"sql":"select 1"}', call_id="c2")
+
+        with patch(
+            "tools.registry.registry.is_external_pause_tool",
+            side_effect=lambda name: name == "db_read_query",
+        ):
+            assert not _should_parallelize_tool_batch([tc1, tc2])
 
 
 class TestMcpParallelToolBatch:
