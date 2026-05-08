@@ -30,6 +30,7 @@ import time
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
+from tools.external_tool_pause import ExternalToolPending
 from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
@@ -837,12 +838,16 @@ def handle_function_call(
                 function_name, function_args,
                 task_id=task_id,
                 enabled_tools=sandbox_enabled,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
             )
         else:
             result = registry.dispatch(
                 function_name, function_args,
                 task_id=task_id,
                 user_task=user_task,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
             )
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
@@ -888,6 +893,8 @@ def handle_function_call(
 
         return result
 
+    except ExternalToolPending:
+        raise
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)

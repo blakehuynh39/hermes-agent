@@ -327,6 +327,7 @@ class PluginContext:
         description: str = "",
         emoji: str = "",
         override: bool = False,
+        external_pause: bool = False,
     ) -> None:
         """Register a tool in the global registry **and** track it as plugin-provided.
 
@@ -348,6 +349,7 @@ class PluginContext:
             description=description,
             emoji=emoji,
             override=override,
+            external_pause=external_pause,
         )
         self._manager._plugin_tool_names.add(name)
         logger.debug(
