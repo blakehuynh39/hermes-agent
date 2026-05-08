@@ -441,6 +441,41 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
     return True
 
 
+def _external_pause_tool_call_index(tool_calls) -> Optional[int]:
+    """Return the first pausable external tool-call index in a batch."""
+    try:
+        from tools.registry import registry
+    except Exception:
+        return None
+    for index, tool_call in enumerate(tool_calls or []):
+        function = getattr(tool_call, "function", None)
+        name = getattr(function, "name", "")
+        try:
+            if registry.is_external_pause_tool(name):
+                return index
+        except Exception:
+            return None
+    return None
+
+
+def _collapse_external_pause_tool_batch(tool_calls):
+    """Keep external-pause tool calls singleton before transcript persistence.
+
+    OpenAI-compatible APIs require every tool_call in an assistant message to
+    receive a tool result before the next model call. External pause tools do
+    not produce their result until a host-owned approval/execution flow resumes
+    the session, so persisting a mixed batch would leave sibling tool calls
+    unanswered. Run only the first pausable tool; the model can request more
+    tools after resume.
+    """
+    if not tool_calls or len(tool_calls) <= 1:
+        return tool_calls
+    pause_index = _external_pause_tool_call_index(tool_calls)
+    if pause_index is None:
+        return tool_calls
+    return [tool_calls[pause_index]]
+
+
 def _extract_parallel_scope_path(tool_name: str, function_args: dict) -> Path | None:
     """Return the normalized file target for path-scoped tools."""
     if tool_name not in _PATH_SCOPED_TOOLS:
@@ -15090,6 +15125,16 @@ class AIAgent:
                     assistant_message.tool_calls = self._deduplicate_tool_calls(
                         assistant_message.tool_calls
                     )
+                    collapsed_tool_calls = _collapse_external_pause_tool_batch(
+                        assistant_message.tool_calls
+                    )
+                    if collapsed_tool_calls is not assistant_message.tool_calls:
+                        if not self.quiet_mode:
+                            self._safe_print(
+                                "⏸ External pause tool emitted with sibling tool calls; "
+                                "running the pausable call first"
+                            )
+                        assistant_message.tool_calls = collapsed_tool_calls
 
                     assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                     
