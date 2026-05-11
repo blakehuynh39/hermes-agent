@@ -6379,6 +6379,28 @@ class AIAgent:
             resume_tool_result=payload,
         )
 
+    def repair_with_instructions(
+        self,
+        *,
+        instructions: str,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        system_message: str = None,
+        task_id: str = None,
+    ) -> Dict[str, Any]:
+        """Continue a session with ephemeral repair instructions.
+
+        This is the repair equivalent of ``resume_with_tool_result``: the model
+        sees the repair instruction on the next request, but Hermes does not
+        persist it as a durable user turn in the session transcript.
+        """
+        return self.run_conversation(
+            "",
+            system_message=system_message,
+            conversation_history=conversation_history,
+            task_id=task_id or self.session_id,
+            repair_instruction=instructions,
+        )
+
     _VALID_API_ROLES = frozenset({"system", "user", "assistant", "tool", "function", "developer"})
 
     @staticmethod
@@ -12049,6 +12071,7 @@ class AIAgent:
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
         resume_tool_result: Optional[Dict[str, Any]] = None,
+        repair_instruction: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run a complete conversation with tool calling until completion.
@@ -12067,6 +12090,9 @@ class AIAgent:
             resume_tool_result: Optional externally approved tool result to
                 append for a previously unanswered tool_call_id without
                 creating a new user turn.
+            repair_instruction: Optional ephemeral repair prompt. When set,
+                Hermes sends it to the model but does not persist it as a user
+                turn.
                     or queuing follow-up prefetch work.
 
         Returns:
@@ -12177,6 +12203,9 @@ class AIAgent:
         self.iteration_budget = IterationBudget(self.max_iterations)
 
         resume_mode = isinstance(resume_tool_result, dict)
+        repair_mode = isinstance(repair_instruction, str) and bool(repair_instruction.strip())
+        if resume_mode and repair_mode:
+            raise ValueError("resume_tool_result and repair_instruction are mutually exclusive.")
 
         # Log conversation turn start for debugging/observability
         _preview_text = _summarize_user_message_for_log(user_message)
@@ -12226,8 +12255,8 @@ class AIAgent:
         # automatically re-applied on every API call (including session continuations).
         
         # Track user turns for memory flush and periodic nudge logic. External
-        # tool resume is a continuation of the prior turn, not a new user turn.
-        if not resume_mode:
+        # tool resume and repair continuations are not new user turns.
+        if not resume_mode and not repair_mode:
             self._user_turn_count += 1
 
         # Reset the streaming context scrubber at the top of each turn so a
@@ -12243,7 +12272,11 @@ class AIAgent:
             think_scrubber.reset()
 
         # Preserve the original user message (no nudge injection).
-        original_user_message = "" if resume_mode else (persist_user_message if persist_user_message is not None else user_message)
+        original_user_message = (
+            ""
+            if (resume_mode or repair_mode)
+            else (persist_user_message if persist_user_message is not None else user_message)
+        )
 
         # Track memory nudge trigger (turn-based, checked here).
         # Skill trigger is checked AFTER the agent loop completes, based on
@@ -12271,6 +12304,9 @@ class AIAgent:
             self._append_external_tool_resume_result(messages, resume_tool_result or {})
             current_turn_user_idx = None
             self._persist_user_message_idx = None
+        elif repair_mode:
+            current_turn_user_idx = None
+            self._persist_user_message_idx = None
         else:
             # Add user message
             user_msg = {"role": "user", "content": user_message}
@@ -12278,7 +12314,7 @@ class AIAgent:
             current_turn_user_idx = len(messages) - 1
             self._persist_user_message_idx = current_turn_user_idx
 
-        if not self.quiet_mode and not resume_mode:
+        if not self.quiet_mode and not (resume_mode or repair_mode):
             _print_preview = _summarize_user_message_for_log(user_message)
             self._safe_print(f"💬 Starting conversation: '{_print_preview[:60]}{'...' if len(_print_preview) > 60 else ''}'")
         
@@ -12417,7 +12453,7 @@ class AIAgent:
         _plugin_user_context = ""
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _pre_results = [] if resume_mode else _invoke_hook(
+            _pre_results = [] if (resume_mode or repair_mode) else _invoke_hook(
                     "pre_llm_call",
                     session_id=self.session_id,
                     user_message=original_user_message,
@@ -12477,7 +12513,7 @@ class AIAgent:
         # Notify memory providers of the new turn so cadence tracking works.
         # Must happen BEFORE prefetch_all() so providers know which turn it is
         # and can gate context/dialectic refresh via contextCadence/dialecticCadence.
-        if self._memory_manager:
+        if self._memory_manager and not repair_mode:
             try:
                 _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
                 self._memory_manager.on_turn_start(self._user_turn_count, _turn_msg)
@@ -12688,6 +12724,12 @@ class AIAgent:
                 # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
                 # The signature field helps maintain reasoning continuity
                 api_messages.append(api_msg)
+
+            # Repair instructions are API-call-time only. They behave like the
+            # next user message for provider role alternation, but are not
+            # appended to ``messages`` and are not persisted to session storage.
+            if repair_mode:
+                api_messages.append({"role": "user", "content": repair_instruction.strip()})
 
             # Build the final system message: cached prompt + ephemeral system prompt.
             # Ephemeral additions are API-call-time only (not persisted to session DB).
@@ -15920,6 +15962,8 @@ class AIAgent:
                 or external_tool_pending_payload.get("pause_id")
                 or ""
             )
+        if repair_mode:
+            result["repair_mode"] = True
         # If a /steer landed after the final assistant turn (no more tool
         # batches to drain into), hand it back to the caller so it can be
         # delivered as the next user turn instead of being silently lost.
