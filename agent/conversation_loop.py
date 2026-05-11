@@ -67,6 +67,7 @@ from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import display_hermes_home as _dhh_fn
 from hermes_logging import set_session_context
+from tools.external_tool_pause import ExternalToolPending
 from tools.schema_sanitizer import strip_pattern_and_format
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
@@ -237,6 +238,8 @@ def run_conversation(
     task_id: str = None,
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[str] = None,
+    resume_tool_result: Optional[Dict[str, Any]] = None,
+    repair_instruction: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -252,6 +255,10 @@ def run_conversation(
         persist_user_message: Optional clean user message to store in
             transcripts/history when user_message contains API-only
             synthetic prefixes.
+        resume_tool_result: Optional externally supplied tool result for a
+            previously unanswered tool call.
+        repair_instruction: Optional ephemeral repair prompt. The model sees
+            it on this request, but it is not persisted as a durable user turn.
                 or queuing follow-up prefetch work.
 
     Returns:
@@ -361,6 +368,11 @@ def run_conversation(
     # calls so that nudge logic accumulates correctly in CLI mode.
     agent.iteration_budget = IterationBudget(agent.max_iterations)
 
+    resume_mode = isinstance(resume_tool_result, dict)
+    repair_mode = isinstance(repair_instruction, str) and bool(repair_instruction.strip())
+    if resume_mode and repair_mode:
+        raise ValueError("resume_tool_result and repair_instruction are mutually exclusive.")
+
     # Log conversation turn start for debugging/observability
     _preview_text = _summarize_user_message_for_log(user_message)
     _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
@@ -408,8 +420,10 @@ def run_conversation(
     # be saved to session DB, session logs, or batch trajectories, but they're
     # automatically re-applied on every API call (including session continuations).
     
-    # Track user turns for memory flush and periodic nudge logic
-    agent._user_turn_count += 1
+    # Track user turns for memory flush and periodic nudge logic. External
+    # tool resumes and repair continuations are not new user turns.
+    if not resume_mode and not repair_mode:
+        agent._user_turn_count += 1
 
     # Reset the streaming context scrubber at the top of each turn so a
     # hung span from a prior interrupted stream can't taint this turn's
@@ -424,13 +438,19 @@ def run_conversation(
         think_scrubber.reset()
 
     # Preserve the original user message (no nudge injection).
-    original_user_message = persist_user_message if persist_user_message is not None else user_message
+    original_user_message = (
+        ""
+        if (resume_mode or repair_mode)
+        else (persist_user_message if persist_user_message is not None else user_message)
+    )
 
     # Track memory nudge trigger (turn-based, checked here).
     # Skill trigger is checked AFTER the agent loop completes, based on
     # how many tool iterations THIS turn used.
     _should_review_memory = False
-    if (agent._memory_nudge_interval > 0
+    if (not resume_mode
+            and not repair_mode
+            and agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
         agent._turns_since_memory += 1
@@ -438,13 +458,21 @@ def run_conversation(
             _should_review_memory = True
             agent._turns_since_memory = 0
 
-    # Add user message
-    user_msg = {"role": "user", "content": user_message}
-    messages.append(user_msg)
-    current_turn_user_idx = len(messages) - 1
-    agent._persist_user_message_idx = current_turn_user_idx
+    if resume_mode:
+        agent._append_external_tool_resume_result(messages, resume_tool_result or {})
+        current_turn_user_idx = None
+        agent._persist_user_message_idx = None
+    elif repair_mode:
+        current_turn_user_idx = None
+        agent._persist_user_message_idx = None
+    else:
+        # Add user message
+        user_msg = {"role": "user", "content": user_message}
+        messages.append(user_msg)
+        current_turn_user_idx = len(messages) - 1
+        agent._persist_user_message_idx = current_turn_user_idx
     
-    if not agent.quiet_mode:
+    if not agent.quiet_mode and not (resume_mode or repair_mode):
         _print_preview = _summarize_user_message_for_log(user_message)
         agent._safe_print(f"💬 Starting conversation: '{_print_preview[:60]}{'...' if len(_print_preview) > 60 else ''}'")
     
@@ -547,7 +575,7 @@ def run_conversation(
     _plugin_user_context = ""
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
+        _pre_results = [] if (resume_mode or repair_mode) else _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
             user_message=original_user_message,
@@ -579,6 +607,7 @@ def run_conversation(
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    external_tool_pending_payload = None
 
     # Per-turn file-mutation verifier state.  Keyed by resolved path;
     # each failed ``write_file`` / ``patch`` call records the error
@@ -607,7 +636,7 @@ def run_conversation(
     # Notify memory providers of the new turn so cadence tracking works.
     # Must happen BEFORE prefetch_all() so providers know which turn it is
     # and can gate context/dialectic refresh via contextCadence/dialecticCadence.
-    if agent._memory_manager:
+    if agent._memory_manager and not repair_mode:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -829,6 +858,9 @@ def run_conversation(
             # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
             # The signature field helps maintain reasoning continuity
             api_messages.append(api_msg)
+
+        if repair_mode:
+            api_messages.append({"role": "user", "content": repair_instruction.strip()})
 
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
@@ -3835,6 +3867,12 @@ def run_conversation(
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break
             
+        except ExternalToolPending as pending:
+            external_tool_pending_payload = pending.to_dict(session_id=agent.session_id)
+            _turn_exit_reason = "external_tool_pending"
+            if not agent.quiet_mode:
+                agent._safe_print("External tool call pending approval/result")
+            break
         except Exception as e:
             error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
             try:
@@ -4116,6 +4154,18 @@ def run_conversation(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    if external_tool_pending_payload:
+        result["termination_reason"] = "external_tool_pending"
+        result["completion_verdict"] = "paused"
+        result["suppress_delivery"] = True
+        result["external_tool_pending"] = external_tool_pending_payload
+        result["external_tool_pause_id"] = (
+            external_tool_pending_payload.get("external_tool_pause_id")
+            or external_tool_pending_payload.get("pause_id")
+            or ""
+        )
+    if repair_mode:
+        result["repair_mode"] = True
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
