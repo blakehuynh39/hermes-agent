@@ -1578,6 +1578,96 @@ class AIAgent:
         from agent.agent_runtime_helpers import repair_message_sequence
         return repair_message_sequence(self, messages)
 
+    @staticmethod
+    def _find_unanswered_tool_call(messages: List[Dict[str, Any]], tool_call_id: str, tool_name: str = "") -> Optional[Dict[str, Any]]:
+        """Find an assistant tool call that has not yet received a tool result."""
+        if not tool_call_id:
+            return None
+        answered_ids = {
+            msg.get("tool_call_id")
+            for msg in messages
+            if isinstance(msg, dict) and msg.get("role") == "tool" and msg.get("tool_call_id")
+        }
+        if tool_call_id in answered_ids:
+            return None
+        for msg in reversed(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                if AIAgent._get_tool_call_id_static(tc) != tool_call_id:
+                    continue
+                actual_name = AIAgent._get_tool_call_name_static(tc)
+                if tool_name and actual_name != tool_name:
+                    return None
+                return {"assistant_message": msg, "tool_call": tc, "tool_name": actual_name}
+        return None
+
+    def _append_external_tool_resume_result(self, messages: List[Dict[str, Any]], resume_tool_result: Dict[str, Any]) -> None:
+        """Append one externally supplied tool result after validating lineage."""
+        tool_call_id = str(resume_tool_result.get("tool_call_id") or "").strip()
+        tool_name = str(resume_tool_result.get("tool_name") or "").strip()
+        content = resume_tool_result.get("content")
+        if not isinstance(content, str):
+            content = json.dumps(content if content is not None else {}, ensure_ascii=False, sort_keys=True)
+        match = self._find_unanswered_tool_call(messages, tool_call_id, tool_name)
+        if match is None:
+            raise ValueError(
+                "Cannot resume external tool result: unanswered tool call not found "
+                f"or already answered (tool_call_id={tool_call_id!r}, tool_name={tool_name!r})"
+            )
+        messages.append({
+            "role": "tool",
+            "name": tool_name or str(match.get("tool_name") or ""),
+            "content": content,
+            "tool_call_id": tool_call_id,
+        })
+
+    def resume_with_tool_result(
+        self,
+        *,
+        session_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        content: str,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        system_message: str = None,
+        task_id: str = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Continue a session by satisfying a pending external tool call."""
+        if session_id and self.session_id != session_id:
+            raise ValueError(f"resume session mismatch: agent={self.session_id!r} payload={session_id!r}")
+        payload = {
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "content": content,
+            "metadata": metadata or {},
+        }
+        return self.run_conversation(
+            "",
+            system_message=system_message,
+            conversation_history=conversation_history,
+            task_id=task_id or session_id or self.session_id,
+            resume_tool_result=payload,
+        )
+
+    def repair_with_instructions(
+        self,
+        *,
+        instructions: str,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        system_message: str = None,
+        task_id: str = None,
+    ) -> Dict[str, Any]:
+        """Continue a session with ephemeral repair instructions."""
+        return self.run_conversation(
+            "",
+            system_message=system_message,
+            conversation_history=conversation_history,
+            task_id=task_id or self.session_id,
+            repair_instruction=instructions,
+        )
+
     def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Persist any un-flushed messages to the SQLite session store.
 
@@ -5308,6 +5398,8 @@ class AIAgent:
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
+        resume_tool_result: Optional[Dict[str, Any]] = None,
+        repair_instruction: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
@@ -5320,6 +5412,8 @@ class AIAgent:
             stream_callback,
             persist_user_message,
             persist_user_timestamp,
+            resume_tool_result,
+            repair_instruction,
         )
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:

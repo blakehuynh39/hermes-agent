@@ -2119,6 +2119,45 @@ class TestExecuteToolCalls:
         assert result["external_tool_pause_id"] == "etpause_1"
         assert not any(msg.get("role") == "tool" and msg.get("tool_call_id") == "c1" for msg in result["messages"])
 
+    def test_repair_with_instructions_is_ephemeral_user_context(self, agent):
+        history = [
+            {"role": "user", "content": "answer in JSON"},
+            {"role": "assistant", "content": "{\"final_answer\":\"old\"}"},
+        ]
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="{\"final_answer\":\"fixed\"}",
+            finish_reason="stop",
+        )
+        persisted = {}
+
+        def capture_persist(messages, conversation_history=None):
+            persisted["messages"] = list(messages)
+            persisted["conversation_history"] = list(conversation_history or [])
+
+        with (
+            patch.object(agent, "_persist_session", side_effect=capture_persist),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.repair_with_instructions(
+                instructions="Repair the prior JSON and call the delivery tool.",
+                conversation_history=history,
+                task_id="repair-session",
+            )
+
+        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert sent_messages[-1] == {
+            "role": "user",
+            "content": "Repair the prior JSON and call the delivery tool.",
+        }
+        assert not any(
+            msg.get("role") == "user" and msg.get("content") == "Repair the prior JSON and call the delivery tool."
+            for msg in result["messages"]
+        )
+        assert persisted["conversation_history"] == history
+        assert result["repair_mode"] is True
+        assert result["messages"][-1]["content"] == "{\"final_answer\":\"fixed\"}"
+
     def test_single_tool_executed(self, agent):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])

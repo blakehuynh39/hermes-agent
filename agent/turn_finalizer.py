@@ -42,6 +42,8 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
+    external_tool_pending_payload=None,
+    repair_mode: bool = False,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -383,6 +385,18 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    if external_tool_pending_payload:
+        result["termination_reason"] = "external_tool_pending"
+        result["completion_verdict"] = "paused"
+        result["suppress_delivery"] = True
+        result["external_tool_pending"] = external_tool_pending_payload
+        result["external_tool_pause_id"] = (
+            external_tool_pending_payload.get("external_tool_pause_id")
+            or external_tool_pending_payload.get("pause_id")
+            or ""
+        )
+    if repair_mode:
+        result["repair_mode"] = True
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

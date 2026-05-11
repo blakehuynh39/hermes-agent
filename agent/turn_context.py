@@ -75,7 +75,11 @@ class TurnContext:
     effective_task_id: str
     turn_id: str
     # Index of the current user turn within ``messages``.
-    current_turn_user_idx: int
+    current_turn_user_idx: Optional[int]
+    # True when resuming a host-owned external tool result instead of adding a user turn.
+    resume_mode: bool = False
+    # True when sending API-only repair instructions instead of adding a user turn.
+    repair_mode: bool = False
     # Whether the post-turn memory review should fire.
     should_review_memory: bool = False
     # Context contributed by ``pre_llm_call`` plugins (appended to user message).
@@ -93,6 +97,8 @@ def build_turn_context(
     stream_callback,
     persist_user_message: Optional[str],
     persist_user_timestamp: Optional[float] = None,
+    resume_tool_result: Optional[Dict[str, Any]] = None,
+    repair_instruction: Optional[str] = None,
     *,
     restore_or_build_system_prompt,
     install_safe_stdio,
@@ -206,6 +212,11 @@ def build_turn_context(
     # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
     agent.iteration_budget = IterationBudget(agent.max_iterations)
 
+    resume_mode = isinstance(resume_tool_result, dict)
+    repair_mode = isinstance(repair_instruction, str) and bool(repair_instruction.strip())
+    if resume_mode and repair_mode:
+        raise ValueError("resume_tool_result and repair_instruction are mutually exclusive.")
+
     # Log conversation turn start for debugging/observability.
     _preview_text = summarize_user_message_for_log(user_message)
     _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
@@ -234,8 +245,10 @@ def build_turn_context(
             if agent._memory_nudge_interval > 0 and agent._turns_since_memory == 0:
                 agent._turns_since_memory = prior_user_turns % agent._memory_nudge_interval
 
-    # Track user turns for memory flush and periodic nudge logic.
-    agent._user_turn_count += 1
+    # Track user turns for memory flush and periodic nudge logic. External
+    # tool resumes and repair continuations are not new user turns.
+    if not resume_mode and not repair_mode:
+        agent._user_turn_count += 1
 
     # Reset the streaming context scrubber at the top of each turn.
     scrubber = getattr(agent, "_stream_context_scrubber", None)
@@ -247,11 +260,17 @@ def build_turn_context(
         think_scrubber.reset()
 
     # Preserve the original user message (no nudge injection).
-    original_user_message = persist_user_message if persist_user_message is not None else user_message
+    original_user_message = (
+        ""
+        if (resume_mode or repair_mode)
+        else (persist_user_message if persist_user_message is not None else user_message)
+    )
 
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False
-    if (agent._memory_nudge_interval > 0
+    if (not resume_mode
+            and not repair_mode
+            and agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
         agent._turns_since_memory += 1
@@ -259,13 +278,21 @@ def build_turn_context(
             should_review_memory = True
             agent._turns_since_memory = 0
 
-    # Add user message.
-    user_msg = {"role": "user", "content": user_message}
-    messages.append(user_msg)
-    current_turn_user_idx = len(messages) - 1
-    agent._persist_user_message_idx = current_turn_user_idx
+    if resume_mode:
+        agent._append_external_tool_resume_result(messages, resume_tool_result or {})
+        current_turn_user_idx = None
+        agent._persist_user_message_idx = None
+    elif repair_mode:
+        current_turn_user_idx = None
+        agent._persist_user_message_idx = None
+    else:
+        # Add user message.
+        user_msg = {"role": "user", "content": user_message}
+        messages.append(user_msg)
+        current_turn_user_idx = len(messages) - 1
+        agent._persist_user_message_idx = current_turn_user_idx
 
-    if not agent.quiet_mode:
+    if not agent.quiet_mode and not (resume_mode or repair_mode):
         _print_preview = summarize_user_message_for_log(user_message)
         agent._safe_print(
             f"💬 Starting conversation: '{_print_preview[:60]}"
@@ -367,7 +394,7 @@ def build_turn_context(
     plugin_user_context = ""
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
+        _pre_results = [] if (resume_mode or repair_mode) else _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
             task_id=effective_task_id,
@@ -407,7 +434,7 @@ def build_turn_context(
         agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
+    if agent._memory_manager and not repair_mode:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -432,6 +459,8 @@ def build_turn_context(
         effective_task_id=effective_task_id,
         turn_id=turn_id,
         current_turn_user_idx=current_turn_user_idx,
+        resume_mode=resume_mode,
+        repair_mode=repair_mode,
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,

@@ -60,6 +60,7 @@ from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
+from tools.external_tool_pause import ExternalToolPending
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
@@ -501,6 +502,8 @@ def run_conversation(
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[str] = None,
     persist_user_timestamp: Optional[float] = None,
+    resume_tool_result: Optional[Dict[str, Any]] = None,
+    repair_instruction: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -518,7 +521,10 @@ def run_conversation(
             synthetic prefixes.
         persist_user_timestamp: Optional platform event timestamp to store
             as metadata on that persisted user message.
-                or queuing follow-up prefetch work.
+        resume_tool_result: Optional externally supplied tool result for a
+            previously unanswered tool call.
+        repair_instruction: Optional ephemeral repair prompt. The model sees
+            it on this request, but it is not persisted as a durable user turn.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -540,6 +546,8 @@ def run_conversation(
         stream_callback,
         persist_user_message,
         persist_user_timestamp,
+        resume_tool_result,
+        repair_instruction,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
         sanitize_surrogates=_sanitize_surrogates,
@@ -556,6 +564,7 @@ def run_conversation(
     effective_task_id = _ctx.effective_task_id
     turn_id = _ctx.turn_id
     current_turn_user_idx = _ctx.current_turn_user_idx
+    repair_mode = _ctx.repair_mode
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
@@ -571,6 +580,7 @@ def run_conversation(
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    external_tool_pending_payload = None
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -779,6 +789,9 @@ def run_conversation(
             # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
             # The signature field helps maintain reasoning continuity
             api_messages.append(api_msg)
+
+        if repair_mode:
+            api_messages.append({"role": "user", "content": repair_instruction.strip()})
 
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
@@ -4500,6 +4513,13 @@ def run_conversation(
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
                 break
             
+        except ExternalToolPending as pending:
+            external_tool_pending_payload = pending.to_dict(session_id=agent.session_id)
+            _turn_exit_reason = "external_tool_pending"
+            if not agent.quiet_mode:
+                agent._safe_print("External tool call pending approval/result")
+            break
+
         except Exception as e:
             error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
             try:
@@ -4575,6 +4595,8 @@ def run_conversation(
         original_user_message=original_user_message,
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
+        external_tool_pending_payload=external_tool_pending_payload,
+        repair_mode=repair_mode,
     )
 
 
