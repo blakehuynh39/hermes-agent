@@ -581,6 +581,7 @@ def run_conversation(
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
     external_tool_pending_payload = None
+    required_final_tool_attempts = 0
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -4488,6 +4489,57 @@ def run_conversation(
                     length_continue_retries = 0
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
+
+                if (
+                    getattr(agent, "required_final_tool_names", None)
+                    and not agent._has_required_final_tool_delivery(messages)
+                ):
+                    if required_final_tool_attempts < agent.required_final_tool_max_attempts:
+                        required_final_tool_attempts += 1
+                        draft_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                        draft_msg["_required_final_tool_synthetic"] = True
+                        messages.append(draft_msg)
+                        messages.append({
+                            "role": "user",
+                            "content": agent._required_final_tool_repair_message(
+                                final_response,
+                                required_final_tool_attempts,
+                            ),
+                            "_required_final_tool_synthetic": True,
+                        })
+                        logger.info(
+                            "Final response missing required final tool delivery; "
+                            "nudging model to call required tool (%d/%d)",
+                            required_final_tool_attempts,
+                            agent.required_final_tool_max_attempts,
+                        )
+                        agent._emit_status(
+                            "Final response requires tool delivery; requesting "
+                            f"required tool call ({required_final_tool_attempts}/"
+                            f"{agent.required_final_tool_max_attempts})"
+                        )
+                        agent._session_messages = messages
+                        agent._save_session_log(messages)
+                        continue
+
+                    _turn_exit_reason = "required_final_tool_missing"
+                    agent._drop_required_final_tool_scaffolding(messages)
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": None,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "partial": True,
+                        "failed": True,
+                        "error": (
+                            "Model produced a final response without calling a "
+                            "required final delivery tool."
+                        ),
+                        "termination_reason": "required_final_tool_missing",
+                        "completion_verdict": "failed",
+                        "required_final_tool_names": list(agent.required_final_tool_names),
+                    }
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
@@ -4506,6 +4558,7 @@ def run_conversation(
                 ):
                     messages.pop()
 
+                agent._drop_required_final_tool_scaffolding(messages)
                 messages.append(final_msg)
                 
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"

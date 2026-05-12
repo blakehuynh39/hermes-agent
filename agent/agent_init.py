@@ -223,6 +223,10 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    self_review_mode: str = "auto",
+    required_final_tool_names: List[str] = None,
+    required_final_tool_max_attempts: int = 2,
+    required_final_tool_instruction: str = None,
 ):
     """
     Initialize the AI Agent.
@@ -301,6 +305,17 @@ def init_agent(
     # would mangle the escape sequences.  None = use builtins.print.
     agent._print_fn = None
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
+    agent.self_review_mode = (self_review_mode or "auto").strip().lower()
+    if agent.self_review_mode not in {"auto", "manual", "disabled"}:
+        raise ValueError("self_review_mode must be one of: auto, manual, disabled")
+    agent.required_final_tool_names = [
+        str(name or "").strip()
+        for name in (required_final_tool_names or [])
+        if str(name or "").strip()
+    ]
+    agent._required_final_tool_name_set = set(agent.required_final_tool_names)
+    agent.required_final_tool_max_attempts = max(0, int(required_final_tool_max_attempts or 0))
+    agent.required_final_tool_instruction = str(required_final_tool_instruction or "").strip()
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity

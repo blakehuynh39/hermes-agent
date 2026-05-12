@@ -168,6 +168,7 @@ def finalize_turn(
     # same empty-response loop again.
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
+        agent._drop_required_final_tool_scaffolding(messages)
         agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
@@ -395,6 +396,9 @@ def finalize_turn(
             or external_tool_pending_payload.get("pause_id")
             or ""
         )
+    if getattr(agent, "required_final_tool_names", None):
+        result["required_final_tool_names"] = list(agent.required_final_tool_names)
+        result["required_final_tool_delivered"] = agent._has_required_final_tool_delivery(messages)
     if repair_mode:
         result["repair_mode"] = True
     # Surface any post-loop cleanup failures so the caller can distinguish a

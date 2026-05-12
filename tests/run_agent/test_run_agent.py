@@ -3657,6 +3657,86 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_required_final_tool_nudges_before_accepting_text_response(self, agent):
+        self._setup_agent(agent)
+        agent.tools = _make_tool_defs("rsi_slack_message_post")
+        agent.valid_tool_names = {"rsi_slack_message_post"}
+        agent.required_final_tool_names = ["rsi_slack_message_post"]
+        agent._required_final_tool_name_set = {"rsi_slack_message_post"}
+        agent.required_final_tool_max_attempts = 2
+        agent.required_final_tool_instruction = "Use message_post for simple prose."
+
+        delivery_call = _mock_tool_call(
+            name="rsi_slack_message_post",
+            arguments='{"channel_id":"C123","text":"Here is the answer."}',
+            call_id="delivery-1",
+        )
+        resp1 = _mock_response(content="Here is the answer.", finish_reason="stop")
+        resp2 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[delivery_call])
+        resp3 = _mock_response(content="Delivered.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3]
+
+        delivery_result = json.dumps(
+            {
+                "status": "ok",
+                "reply_delivery": {
+                    "tool_name": "rsi_slack.message_post",
+                    "send_status": "posted",
+                    "provider_ref": "slack:C123:123.456",
+                },
+            }
+        )
+
+        with (
+            patch("run_agent.handle_function_call", return_value=delivery_result) as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer in Slack")
+
+        assert result["final_response"] == "Delivered."
+        assert result["completed"] is True
+        assert result["required_final_tool_delivered"] is True
+        assert mock_handle_function_call.call_args.args[0] == "rsi_slack_message_post"
+
+        second_call_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        assert second_call_messages[-1]["role"] == "user"
+        assert "requires final delivery through a tool call" in second_call_messages[-1]["content"]
+        assert "Here is the answer." in second_call_messages[-1]["content"]
+
+        assert not any(
+            msg.get("_required_final_tool_synthetic")
+            for msg in result["messages"]
+            if isinstance(msg, dict)
+        )
+        assert any(
+            msg.get("role") == "tool" and msg.get("tool_call_id") == "delivery-1"
+            for msg in result["messages"]
+        )
+
+    def test_required_final_tool_fails_closed_after_bounded_attempts(self, agent):
+        self._setup_agent(agent)
+        agent.required_final_tool_names = ["rsi_slack_message_post"]
+        agent._required_final_tool_name_set = {"rsi_slack_message_post"}
+        agent.required_final_tool_max_attempts = 1
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="Draft answer", finish_reason="stop"),
+            _mock_response(content="Still no tool", finish_reason="stop"),
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer in Slack")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["termination_reason"] == "required_final_tool_missing"
+        assert result["required_final_tool_names"] == ["rsi_slack_message_post"]
+
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
