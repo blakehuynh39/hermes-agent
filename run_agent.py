@@ -1224,6 +1224,9 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         self_review_mode: str = "auto",
+        required_final_tool_names: List[str] = None,
+        required_final_tool_max_attempts: int = 2,
+        required_final_tool_instruction: str = None,
     ):
         """
         Initialize the AI Agent.
@@ -1302,6 +1305,14 @@ class AIAgent:
         self.self_review_mode = (self_review_mode or "auto").strip().lower()
         if self.self_review_mode not in {"auto", "manual", "disabled"}:
             raise ValueError("self_review_mode must be one of: auto, manual, disabled")
+        self.required_final_tool_names = [
+            str(name or "").strip()
+            for name in (required_final_tool_names or [])
+            if str(name or "").strip()
+        ]
+        self._required_final_tool_name_set = set(self.required_final_tool_names)
+        self.required_final_tool_max_attempts = max(0, int(required_final_tool_max_attempts or 0))
+        self.required_final_tool_instruction = str(required_final_tool_instruction or "").strip()
         self.skip_context_files = skip_context_files
         self.load_soul_identity = load_soul_identity
         self.pass_session_id = pass_session_id
@@ -6329,6 +6340,87 @@ class AIAgent:
                     return None
                 return {"assistant_message": msg, "tool_call": tc, "tool_name": actual_name}
         return None
+
+    @staticmethod
+    def _required_final_tool_result_succeeded(content: Any) -> bool:
+        if not isinstance(content, str):
+            return False
+        text = content.strip()
+        if not text:
+            return False
+        try:
+            payload = json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        reply_delivery = payload.get("reply_delivery")
+        if isinstance(reply_delivery, dict):
+            status = str(
+                reply_delivery.get("send_status")
+                or reply_delivery.get("status")
+                or ""
+            ).strip().lower()
+            if status in {"posted", "sent", "succeeded", "success", "completed", "ok"}:
+                return True
+        status = str(payload.get("status") or "").strip().lower()
+        if status in {"ok", "success", "succeeded", "completed"}:
+            return True
+        output = payload.get("output")
+        if isinstance(output, dict) and output.get("ok") is True:
+            return True
+        return False
+
+    def _has_required_final_tool_delivery(self, messages: List[Dict[str, Any]]) -> bool:
+        required = set(getattr(self, "_required_final_tool_name_set", set()) or set())
+        if not required:
+            return True
+        required_call_ids: set[str] = set()
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                tool_name = self._get_tool_call_name_static(tc)
+                if tool_name not in required:
+                    continue
+                tool_call_id = self._get_tool_call_id_static(tc)
+                if tool_call_id:
+                    required_call_ids.add(tool_call_id)
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            tool_call_id = str(msg.get("tool_call_id") or "").strip()
+            tool_name = str(msg.get("name") or "").strip()
+            if tool_call_id not in required_call_ids and tool_name not in required:
+                continue
+            if self._required_final_tool_result_succeeded(msg.get("content")):
+                return True
+        return False
+
+    def _required_final_tool_repair_message(self, draft_response: str, attempt: int) -> str:
+        tool_list = ", ".join(self.required_final_tool_names)
+        custom = self.required_final_tool_instruction
+        parts = [
+            "[System: The previous assistant message was a final response draft, but this session requires final delivery through a tool call.]",
+            f"Required final tool(s): {tool_list}.",
+            f"Attempt {attempt} of {self.required_final_tool_max_attempts}.",
+            "Call exactly one appropriate required final tool now, using the existing draft as the source of truth. Do not perform new research unless the draft is impossible to deliver as-is.",
+        ]
+        if custom:
+            parts.append(custom)
+        if draft_response:
+            parts.extend(["", "Draft response to deliver:", draft_response])
+        return "\n".join(parts)
+
+    @staticmethod
+    def _drop_required_final_tool_scaffolding(messages: List[Dict[str, Any]]) -> None:
+        if not messages:
+            return
+        messages[:] = [
+            msg
+            for msg in messages
+            if not (isinstance(msg, dict) and msg.get("_required_final_tool_synthetic"))
+        ]
 
     def _append_external_tool_resume_result(self, messages: List[Dict[str, Any]], resume_tool_result: Dict[str, Any]) -> None:
         """Append one externally supplied tool result after validating lineage."""
@@ -12220,6 +12312,7 @@ class AIAgent:
 
         # Initialize conversation (copy to avoid mutating the caller's list)
         messages = list(conversation_history) if conversation_history else []
+        required_final_tool_attempts = 0
 
         # Hydrate todo store from conversation history (gateway creates a fresh
         # AIAgent per message, so the in-memory store is empty -- we need to
@@ -15644,6 +15737,57 @@ class AIAgent:
                         length_continue_retries = 0
                     
                     final_response = self._strip_think_blocks(final_response).strip()
+
+                    if (
+                        self.required_final_tool_names
+                        and not self._has_required_final_tool_delivery(messages)
+                    ):
+                        if required_final_tool_attempts < self.required_final_tool_max_attempts:
+                            required_final_tool_attempts += 1
+                            draft_msg = self._build_assistant_message(assistant_message, finish_reason)
+                            draft_msg["_required_final_tool_synthetic"] = True
+                            messages.append(draft_msg)
+                            messages.append({
+                                "role": "user",
+                                "content": self._required_final_tool_repair_message(
+                                    final_response,
+                                    required_final_tool_attempts,
+                                ),
+                                "_required_final_tool_synthetic": True,
+                            })
+                            logger.info(
+                                "Final response missing required final tool delivery; "
+                                "nudging model to call required tool (%d/%d)",
+                                required_final_tool_attempts,
+                                self.required_final_tool_max_attempts,
+                            )
+                            self._emit_status(
+                                "↻ Final response requires tool delivery — "
+                                f"requesting required tool call ({required_final_tool_attempts}/"
+                                f"{self.required_final_tool_max_attempts})"
+                            )
+                            self._session_messages = messages
+                            self._save_session_log(messages)
+                            continue
+
+                        _turn_exit_reason = "required_final_tool_missing"
+                        self._drop_required_final_tool_scaffolding(messages)
+                        self._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": None,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "partial": True,
+                            "failed": True,
+                            "error": (
+                                "Model produced a final response without calling a "
+                                "required final delivery tool."
+                            ),
+                            "termination_reason": "required_final_tool_missing",
+                            "completion_verdict": "failed",
+                            "required_final_tool_names": list(self.required_final_tool_names),
+                        }
                     
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)
 
@@ -15662,6 +15806,7 @@ class AIAgent:
                     ):
                         messages.pop()
 
+                    self._drop_required_final_tool_scaffolding(messages)
                     messages.append(final_msg)
                     
                     _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
@@ -15794,6 +15939,7 @@ class AIAgent:
         # can replay assistant("(empty)") / recovery nudges and fall into the
         # same empty-response loop again.
         self._drop_trailing_empty_response_scaffolding(messages)
+        self._drop_required_final_tool_scaffolding(messages)
         self._persist_session(messages, conversation_history)
 
         # ── Turn-exit diagnostic log ─────────────────────────────────────
@@ -15962,6 +16108,9 @@ class AIAgent:
                 or external_tool_pending_payload.get("pause_id")
                 or ""
             )
+        if self.required_final_tool_names:
+            result["required_final_tool_names"] = list(self.required_final_tool_names)
+            result["required_final_tool_delivered"] = self._has_required_final_tool_delivery(messages)
         if repair_mode:
             result["repair_mode"] = True
         # If a /steer landed after the final assistant turn (no more tool
