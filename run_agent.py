@@ -412,6 +412,10 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        self_review_mode: str = "auto",
+        required_final_tool_names: List[str] = None,
+        required_final_tool_max_attempts: int = 2,
+        required_final_tool_instruction: str = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -481,6 +485,10 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            self_review_mode=self_review_mode,
+            required_final_tool_names=required_final_tool_names,
+            required_final_tool_max_attempts=required_final_tool_max_attempts,
+            required_final_tool_instruction=required_final_tool_instruction,
         )
 
     def _get_session_db_for_recall(self):
@@ -1260,6 +1268,81 @@ class AIAgent:
                     return None
                 return {"assistant_message": msg, "tool_call": tc, "tool_name": actual_name}
         return None
+
+    @staticmethod
+    def _required_final_tool_result_succeeded(content: Any) -> bool:
+        if not isinstance(content, str):
+            return False
+        text = content.strip()
+        if not text:
+            return False
+        try:
+            payload = json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        reply_delivery = payload.get("reply_delivery")
+        if isinstance(reply_delivery, dict):
+            status = str(reply_delivery.get("send_status") or reply_delivery.get("status") or "").strip().lower()
+            if status in {"posted", "sent", "succeeded", "success", "completed", "ok"}:
+                return True
+        status = str(payload.get("status") or "").strip().lower()
+        if status in {"ok", "success", "succeeded", "completed"}:
+            return True
+        output = payload.get("output")
+        return isinstance(output, dict) and output.get("ok") is True
+
+    def _has_required_final_tool_delivery(self, messages: List[Dict[str, Any]]) -> bool:
+        required = set(getattr(self, "_required_final_tool_name_set", set()) or set())
+        if not required:
+            return True
+        required_call_ids: set[str] = set()
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                tool_name = self._get_tool_call_name_static(tc)
+                if tool_name not in required:
+                    continue
+                tool_call_id = self._get_tool_call_id_static(tc)
+                if tool_call_id:
+                    required_call_ids.add(tool_call_id)
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            tool_call_id = str(msg.get("tool_call_id") or "").strip()
+            tool_name = str(msg.get("name") or "").strip()
+            if tool_call_id not in required_call_ids and tool_name not in required:
+                continue
+            if self._required_final_tool_result_succeeded(msg.get("content")):
+                return True
+        return False
+
+    def _required_final_tool_repair_message(self, draft_response: str, attempt: int) -> str:
+        tool_list = ", ".join(self.required_final_tool_names)
+        parts = [
+            "[System: The previous assistant message was a final response draft, but this session requires final delivery through a tool call.]",
+            f"Required final tool(s): {tool_list}.",
+            f"Attempt {attempt} of {self.required_final_tool_max_attempts}.",
+            "Call exactly one appropriate required final tool now, using the existing draft as the source of truth. Do not perform new research unless the draft is impossible to deliver as-is.",
+        ]
+        custom = str(getattr(self, "required_final_tool_instruction", "") or "").strip()
+        if custom:
+            parts.append(custom)
+        if draft_response:
+            parts.extend(["", "Draft response to deliver:", draft_response])
+        return "\n".join(parts)
+
+    @staticmethod
+    def _drop_required_final_tool_scaffolding(messages: List[Dict[str, Any]]) -> None:
+        if not messages:
+            return
+        messages[:] = [
+            msg
+            for msg in messages
+            if not (isinstance(msg, dict) and msg.get("_required_final_tool_synthetic"))
+        ]
 
     def _append_external_tool_resume_result(self, messages: List[Dict[str, Any]], resume_tool_result: Dict[str, Any]) -> None:
         """Append one externally supplied tool result after validating lineage."""
