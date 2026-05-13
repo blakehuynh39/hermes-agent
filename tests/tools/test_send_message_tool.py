@@ -583,6 +583,7 @@ class TestSendMessageTool:
             "hello",
             thread_id="171000001.000100",
             media_files=[],
+            force_document=False,
         )
         receipt_files = list((tmp_path / "rsi_runtime" / "deliveries").glob("*.json"))
         assert len(receipt_files) == 1
