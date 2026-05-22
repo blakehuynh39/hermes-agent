@@ -18,6 +18,13 @@ from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
+_DEEPSEEK_THINKING_OMIT_FIELDS = {
+    "temperature",
+    "top_p",
+    "presence_penalty",
+    "frequency_penalty",
+}
+
 
 def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> dict | None:
     """Translate Hermes/OpenRouter-style reasoning config to Gemini thinkingConfig."""
@@ -113,6 +120,16 @@ def _model_consumes_thought_signature(model: Any) -> bool:
     """
     m = str(model or "").lower()
     return "gemini" in m or "gemma" in m
+
+
+def _deepseek_thinking_enabled(profile: Any, extra_body: dict[str, Any]) -> bool:
+    """Return True when the DeepSeek request is explicitly in thinking mode."""
+    if getattr(profile, "name", "") != "deepseek":
+        return False
+    thinking = extra_body.get("thinking")
+    if not isinstance(thinking, dict):
+        return False
+    return str(thinking.get("type") or "").strip().lower() == "enabled"
 
 
 class ChatCompletionsTransport(ProviderTransport):
@@ -568,6 +585,10 @@ class ChatCompletionsTransport(ProviderTransport):
                     extra_body.update(v)
                 else:
                     api_kwargs[k] = v
+
+        if _deepseek_thinking_enabled(profile, extra_body):
+            for field in _DEEPSEEK_THINKING_OMIT_FIELDS:
+                api_kwargs.pop(field, None)
 
         if extra_body:
             # Native Gemini (generativelanguage.googleapis.com, non-/openai)
