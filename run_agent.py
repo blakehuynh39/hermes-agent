@@ -412,6 +412,10 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        self_review_mode: str = "auto",
+        required_final_tool_names: List[str] = None,
+        required_final_tool_max_attempts: int = 2,
+        required_final_tool_instruction: str = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -481,6 +485,10 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            self_review_mode=self_review_mode,
+            required_final_tool_names=required_final_tool_names,
+            required_final_tool_max_attempts=required_final_tool_max_attempts,
+            required_final_tool_instruction=required_final_tool_instruction,
         )
 
     def _get_session_db_for_recall(self):
