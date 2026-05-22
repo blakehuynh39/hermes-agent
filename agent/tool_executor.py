@@ -45,6 +45,7 @@ from tools.tool_result_storage import (
     enforce_turn_budget,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from tools.external_tool_pause import ExternalToolPending
 
 logger = logging.getLogger(__name__)
 
@@ -540,6 +541,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.info("tool %s cancelled (%.2fs)", function_name, duration)
                 results[index] = (function_name, function_args, result, duration, True, False, middleware_trace)
                 return
+            except ExternalToolPending:
+                raise
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -1168,6 +1171,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     execute=_execute,
                 )
                 _ce_result = function_result
+            except ExternalToolPending:
+                raise
             except Exception as tool_error:
                 function_result = json.dumps({"error": f"Context engine tool '{function_name}' failed: {tool_error}"})
                 logger.error("context_engine.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -1201,6 +1206,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     execute=_execute,
                 )
                 _mem_result = function_result
+            except ExternalToolPending:
+                raise
             except Exception as tool_error:
                 function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
                 logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -1251,6 +1258,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 except Exception:
                     pass
                 raise
+            except ExternalToolPending:
+                raise
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -1290,6 +1299,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent.interrupt("keyboard interrupt")
                 except Exception:
                     pass
+                raise
+            except ExternalToolPending:
                 raise
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"

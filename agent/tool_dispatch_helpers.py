@@ -153,6 +153,33 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
     return True
 
 
+def _external_pause_tool_call_index(tool_calls) -> Optional[int]:
+    """Return the first pausable external tool-call index in a batch."""
+    try:
+        from tools.registry import registry
+    except Exception:
+        return None
+    for index, tool_call in enumerate(tool_calls or []):
+        function = getattr(tool_call, "function", None)
+        name = getattr(function, "name", "")
+        try:
+            if registry.is_external_pause_tool(name):
+                return index
+        except Exception:
+            return None
+    return None
+
+
+def _collapse_external_pause_tool_batch(tool_calls):
+    """Keep external-pause tool calls singleton before transcript persistence."""
+    if not tool_calls or len(tool_calls) <= 1:
+        return tool_calls
+    pause_index = _external_pause_tool_call_index(tool_calls)
+    if pause_index is None:
+        return tool_calls
+    return [tool_calls[pause_index]]
+
+
 def _extract_parallel_scope_path(tool_name: str, function_args: dict) -> Optional[Path]:
     """Return the normalized file target for path-scoped tools."""
     if tool_name not in _PATH_SCOPED_TOOLS:
@@ -412,6 +439,8 @@ __all__ = [
     "_REDIRECT_OVERWRITE",
     "_is_destructive_command",
     "_should_parallelize_tool_batch",
+    "_external_pause_tool_call_index",
+    "_collapse_external_pause_tool_batch",
     "_extract_parallel_scope_path",
     "_paths_overlap",
     "_is_multimodal_tool_result",

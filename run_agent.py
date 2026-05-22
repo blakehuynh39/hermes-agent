@@ -200,6 +200,8 @@ from agent.trajectory import (
 from agent.tool_dispatch_helpers import (
     _should_parallelize_tool_batch,
     _is_destructive_command,  # noqa: F401  # re-exported for tests that access `run_agent._is_destructive_command`
+    _external_pause_tool_call_index,  # noqa: F401  # re-exported for tests that access `run_agent._external_pause_tool_call_index`
+    _collapse_external_pause_tool_batch,  # noqa: F401  # re-exported for tests that access `run_agent._collapse_external_pause_tool_batch`
     _extract_parallel_scope_path,  # noqa: F401  # re-exported for tests that `from run_agent import _extract_parallel_scope_path`
     _paths_overlap,  # noqa: F401  # re-exported for tests that `from run_agent import _paths_overlap`
     _is_multimodal_tool_result,
