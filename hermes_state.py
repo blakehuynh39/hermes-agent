@@ -16,12 +16,19 @@ Key design decisions:
 
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
@@ -329,13 +336,21 @@ class SessionDB:
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
     # Attempt a PASSIVE WAL checkpoint every N successful writes.
     _CHECKPOINT_EVERY_N_WRITES = 50
+    _PROCESS_LOCKS_GUARD = threading.Lock()
+    _PROCESS_LOCKS: Dict[Path, threading.RLock] = {}
 
     def __init__(self, db_path: Path = None):
         self.db_path = db_path or DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._shared_lock_path = (
+            self.db_path.parent / ".locks" / f"{self.db_path.name}.lock"
+        )
+        self._process_lock = self._get_process_lock(self._shared_lock_path)
 
         self._lock = threading.Lock()
         self._write_count = 0
+        self._journal_mode = self._resolve_journal_mode()
+        self._wal_enabled = False
         try:
             self._conn = sqlite3.connect(
                 str(self.db_path),
@@ -351,10 +366,27 @@ class SessionDB:
                 isolation_level=None,
             )
             self._conn.row_factory = sqlite3.Row
-            apply_wal_with_fallback(self._conn, db_label="state.db")
-            self._conn.execute("PRAGMA foreign_keys=ON")
+            with self._shared_db_lock():
+                if self._journal_mode == "WAL":
+                    actual_journal_mode = apply_wal_with_fallback(
+                        self._conn,
+                        db_label="state.db",
+                    )
+                else:
+                    actual_journal_mode = self._conn.execute(
+                        f"PRAGMA journal_mode={self._journal_mode}"
+                    ).fetchone()[0]
+                    if str(actual_journal_mode).upper() != self._journal_mode:
+                        logger.warning(
+                            "SQLite requested journal_mode=%s but got %s for %s",
+                            self._journal_mode,
+                            actual_journal_mode,
+                            self.db_path,
+                        )
+                self._wal_enabled = str(actual_journal_mode).lower() == "wal"
+                self._conn.execute("PRAGMA foreign_keys=ON")
 
-            self._init_schema()
+                self._init_schema()
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
@@ -370,6 +402,50 @@ class SessionDB:
             # ``hermes_state._set_last_init_error(None)`` explicitly.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
+
+    @classmethod
+    def _get_process_lock(cls, lock_path: Path) -> threading.RLock:
+        resolved = lock_path.resolve()
+        with cls._PROCESS_LOCKS_GUARD:
+            lock = cls._PROCESS_LOCKS.get(resolved)
+            if lock is None:
+                lock = threading.RLock()
+                cls._PROCESS_LOCKS[resolved] = lock
+            return lock
+
+    @staticmethod
+    def _resolve_journal_mode() -> str:
+        """Resolve the SQLite journal mode for state.db.
+
+        WAL stays the local-disk default. Shared homes on EFS/NFS can set
+        ``HERMES_STATE_DB_JOURNAL_MODE=DELETE`` to avoid WAL sidecar
+        coordination failures across pods.
+        """
+        raw = os.getenv("HERMES_STATE_DB_JOURNAL_MODE", "WAL").strip().upper()
+        allowed = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
+        if raw not in allowed:
+            logger.warning(
+                "Ignoring unsupported HERMES_STATE_DB_JOURNAL_MODE=%r; using WAL",
+                raw,
+            )
+            return "WAL"
+        return raw
+
+    @contextmanager
+    def _shared_db_lock(self):
+        """Serialize SQLite write-lock acquisition across Hermes processes."""
+        with self._process_lock:
+            if fcntl is None:
+                yield
+                return
+
+            self._shared_lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._shared_lock_path.open("a+") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     # ── Core write helper ──
 
@@ -391,20 +467,24 @@ class SessionDB:
         last_err: Optional[Exception] = None
         for attempt in range(self._WRITE_MAX_RETRIES):
             try:
-                with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
+                with self._shared_db_lock():
+                    with self._lock:
+                        self._conn.execute("BEGIN IMMEDIATE")
                         try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
+                            result = fn(self._conn)
+                            self._conn.commit()
+                        except BaseException:
+                            try:
+                                self._conn.rollback()
+                            except Exception:
+                                pass
+                            raise
                 # Success — periodic best-effort checkpoint.
                 self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                if (
+                    self._wal_enabled
+                    and self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0
+                ):
                     self._try_wal_checkpoint()
                 return result
             except sqlite3.OperationalError as exc:
@@ -433,16 +513,19 @@ class SessionDB:
         from growing unbounded when many processes hold persistent
         connections.
         """
+        if not self._wal_enabled:
+            return
         try:
-            with self._lock:
-                result = self._conn.execute(
-                    "PRAGMA wal_checkpoint(PASSIVE)"
-                ).fetchone()
-                if result and result[1] > 0:
-                    logger.debug(
-                        "WAL checkpoint: %d/%d pages checkpointed",
-                        result[2], result[1],
-                    )
+            with self._shared_db_lock():
+                with self._lock:
+                    result = self._conn.execute(
+                        "PRAGMA wal_checkpoint(PASSIVE)"
+                    ).fetchone()
+                    if result and result[1] > 0:
+                        logger.debug(
+                            "WAL checkpoint: %d/%d pages checkpointed",
+                            result[2], result[1],
+                        )
         except Exception:
             pass  # Best effort — never fatal.
 
@@ -452,14 +535,16 @@ class SessionDB:
         Attempts a PASSIVE WAL checkpoint first so that exiting processes
         help keep the WAL file from growing unbounded.
         """
-        with self._lock:
-            if self._conn:
-                try:
-                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                except Exception:
-                    pass
-                self._conn.close()
-                self._conn = None
+        with self._shared_db_lock():
+            with self._lock:
+                if self._conn:
+                    if self._wal_enabled:
+                        try:
+                            self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        except Exception:
+                            pass
+                    self._conn.close()
+                    self._conn = None
 
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
@@ -3271,3 +3356,31 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+
+SQLiteSessionDB = SessionDB
+
+
+def _resolve_state_backend() -> str:
+    raw = os.getenv("HERMES_STATE_BACKEND", "sqlite").strip().lower()
+    if raw in {"", "sqlite"}:
+        return "sqlite"
+    if raw in {"postgres", "postgresql", "pg"}:
+        return "postgres"
+    logger.warning("Ignoring unsupported HERMES_STATE_BACKEND=%r; using sqlite", raw)
+    return "sqlite"
+
+
+class SessionDB(SQLiteSessionDB):
+    """Backend-selecting SessionDB facade.
+
+    SQLite remains the default local backend. Production deployments can set
+    ``HERMES_STATE_BACKEND=postgres`` to use managed Postgres without changing
+    existing imports such as ``from hermes_state import SessionDB``.
+    """
+
+    def __new__(cls, db_path: Path = None):
+        if cls is SessionDB and _resolve_state_backend() == "postgres":
+            from hermes_state_postgres import PostgresSessionDB
+
+            return PostgresSessionDB(db_path=db_path)
+        return super().__new__(cls)
