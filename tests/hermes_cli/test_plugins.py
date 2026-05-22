@@ -662,6 +662,41 @@ class TestPluginContext:
         from tools.registry import registry
         assert "plugin_echo" in registry._tools
 
+    def test_register_tool_marks_external_pause_tool(self, tmp_path, monkeypatch):
+        """Plugin tools can opt into host-owned external pause handling."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        plugin_dir = plugins_dir / "pause_plugin"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text(yaml.dump({"name": "pause_plugin"}))
+        (plugin_dir / "__init__.py").write_text(
+            'def register(ctx):\n'
+            '    ctx.register_tool(\n'
+            '        name="pause_tool",\n'
+            '        toolset="plugin_pause_plugin",\n'
+            '        schema={"name": "pause_tool", "description": "Pause", "parameters": {"type": "object", "properties": {}}},\n'
+            '        handler=lambda args, **kw: "pause",\n'
+            '        external_pause=True,\n'
+            '    )\n'
+        )
+        hermes_home = tmp_path / "hermes_test"
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["pause_plugin"]}})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        try:
+            mgr = PluginManager()
+            mgr.discover_and_load()
+
+            from tools.registry import registry
+
+            assert "pause_tool" in mgr._plugin_tool_names
+            assert registry.is_external_pause_tool("pause_tool") is True
+        finally:
+            from tools.registry import registry
+
+            registry.deregister("pause_tool")
+
     def test_register_tool_rejects_shadow_without_override(self, tmp_path, monkeypatch, caplog):
         """Without override=True, registering a tool name claimed by a different toolset is rejected."""
         from tools.registry import registry

@@ -80,12 +80,13 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides",
+        "max_result_size_chars", "dynamic_schema_overrides", "external_pause",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 external_pause=False):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -104,6 +105,7 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.external_pause = bool(external_pause)
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +246,7 @@ class ToolRegistry:
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
+        external_pause: bool = False,
         override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -299,6 +302,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                external_pause=external_pause,
             )
             if check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
@@ -403,6 +407,12 @@ class ToolRegistry:
                 return _run_async(entry.handler(args, **kwargs))
             return entry.handler(args, **kwargs)
         except Exception as e:
+            try:
+                from tools.external_tool_pause import ExternalToolPending
+                if isinstance(e, ExternalToolPending):
+                    raise
+            except ImportError:
+                pass
             logger.exception("Tool %s dispatch error: %s", name, e)
             # Route through the sanitizer so framing tokens / CDATA / fences
             # in exception strings don't reach the model as structural noise.
@@ -414,6 +424,11 @@ class ToolRegistry:
             except Exception:
                 sanitized = raw  # defensive: never let the sanitizer block error propagation
             return json.dumps({"error": sanitized})
+
+    def is_external_pause_tool(self, name: str) -> bool:
+        """Return True when a tool must run on the sequential pause path."""
+        entry = self.get_entry(name)
+        return bool(entry and entry.external_pause)
 
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)

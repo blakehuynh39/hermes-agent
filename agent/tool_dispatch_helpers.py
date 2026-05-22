@@ -106,6 +106,12 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
         return False
 
     tool_names = [tc.function.name for tc in tool_calls]
+    try:
+        from tools.registry import registry
+        if any(registry.is_external_pause_tool(name) for name in tool_names):
+            return False
+    except Exception:
+        pass
     if any(name in _NEVER_PARALLEL_TOOLS for name in tool_names):
         return False
 

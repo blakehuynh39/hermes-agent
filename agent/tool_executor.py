@@ -48,6 +48,7 @@ from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
 )
+from tools.external_tool_pause import ExternalToolPending
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +243,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 messages=messages,
                 pre_tool_block_checked=True,
             )
+        except ExternalToolPending:
+            raise
         except Exception as tool_error:
             result = f"Error executing tool '{function_name}': {tool_error}"
             logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -701,6 +704,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 function_result = agent.context_compressor.handle_tool_call(function_name, function_args, messages=messages)
                 _ce_result = function_result
+            except ExternalToolPending:
+                raise
             except Exception as tool_error:
                 function_result = json.dumps({"error": f"Context engine tool '{function_name}' failed: {tool_error}"})
                 logger.error("context_engine.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -725,6 +730,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 function_result = agent._memory_manager.handle_tool_call(function_name, function_args)
                 _mem_result = function_result
+            except ExternalToolPending:
+                raise
             except Exception as tool_error:
                 function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
                 logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -753,6 +760,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_pre_tool_call_hook=True,
                 )
                 _spinner_result = function_result
+            except ExternalToolPending:
+                raise
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -772,6 +781,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                     skip_pre_tool_call_hook=True,
                 )
+            except ExternalToolPending:
+                raise
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
