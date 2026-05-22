@@ -64,6 +64,7 @@ from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad
+from agent.tool_dispatch_helpers import _collapse_external_pause_tool_batch
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import display_hermes_home as _dhh_fn
 from hermes_logging import set_session_context
@@ -3386,6 +3387,16 @@ def run_conversation(
                 assistant_message.tool_calls = agent._deduplicate_tool_calls(
                     assistant_message.tool_calls
                 )
+                collapsed_tool_calls = _collapse_external_pause_tool_batch(
+                    assistant_message.tool_calls
+                )
+                if collapsed_tool_calls is not assistant_message.tool_calls:
+                    if not agent.quiet_mode:
+                        agent._safe_print(
+                            "External pause tool emitted with sibling tool calls; "
+                            "running the pausable call first"
+                        )
+                    assistant_message.tool_calls = collapsed_tool_calls
 
                 assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
                 

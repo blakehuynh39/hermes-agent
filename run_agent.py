@@ -192,6 +192,8 @@ from agent.tool_dispatch_helpers import (
     _REDIRECT_OVERWRITE,
     _is_destructive_command,
     _should_parallelize_tool_batch,
+    _external_pause_tool_call_index,
+    _collapse_external_pause_tool_batch,
     _extract_parallel_scope_path,
     _paths_overlap,
     _is_multimodal_tool_result,
