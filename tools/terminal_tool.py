@@ -37,6 +37,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import time
 import threading
 import atexit
@@ -452,6 +453,124 @@ def _safe_command_preview(command: Any, limit: int = 200) -> str:
         return repr(command)[:limit]
     except Exception:
         return f"<{type(command).__name__}>"
+
+
+_RSI_LOCAL_KANBAN_DISABLED_MESSAGE = (
+    "Hermes local Kanban is disabled in RSI. Use RSI native Kanban tools "
+    "(`rsi_kanban.*`) backed by platform Postgres instead."
+)
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _rsi_local_kanban_disabled() -> bool:
+    return _truthy_env("RSI_DISABLE_HERMES_LOCAL_KANBAN")
+
+
+def _shell_tokens(command: str) -> list[str] | None:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _split_shell_segments(tokens: list[str]) -> list[list[str]]:
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in {";", "&&", "||", "|", "&"}:
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _basename_token(token: str) -> str:
+    return os.path.basename(token)
+
+
+def _tokens_run_hermes_kanban(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+
+    i = 0
+    while i < len(tokens) and _looks_like_env_assignment(tokens[i]):
+        i += 1
+    if i >= len(tokens):
+        return False
+
+    if tokens[i] == "env":
+        i += 1
+        while i < len(tokens):
+            token = tokens[i]
+            if token == "--":
+                i += 1
+                break
+            if _looks_like_env_assignment(token):
+                i += 1
+                continue
+            if token.startswith("-"):
+                i += 1
+                continue
+            break
+        if i >= len(tokens):
+            return False
+
+    while i < len(tokens) and _basename_token(tokens[i]) in {"sudo", "command", "nohup"}:
+        i += 1
+        while i < len(tokens) and tokens[i].startswith("-"):
+            i += 1
+
+    if i + 1 < len(tokens) and _basename_token(tokens[i]) == "hermes" and tokens[i + 1] == "kanban":
+        return True
+
+    if _tokens_run_python_kanban(tokens[i:]):
+        return True
+
+    if (
+        i + 2 < len(tokens)
+        and _basename_token(tokens[i]) in {"uv", "poetry", "pipenv", "rye"}
+        and tokens[i + 1] == "run"
+    ):
+        return _tokens_run_hermes_kanban(tokens[i + 2 :])
+
+    return False
+
+
+def _tokens_run_python_kanban(tokens: list[str]) -> bool:
+    if len(tokens) < 3:
+        return False
+    python_name = _basename_token(tokens[0])
+    if not (python_name == "python" or python_name.startswith("python3")):
+        return False
+    if tokens[1] != "-m":
+        return False
+    module = tokens[2]
+    if module == "hermes_cli.kanban":
+        return True
+    return module == "hermes_cli.main" and len(tokens) > 3 and tokens[3] == "kanban"
+
+
+def _command_invokes_local_hermes_kanban(command: str) -> bool:
+    tokens = _shell_tokens(command)
+    if tokens is None:
+        pattern = re.compile(
+            r"(^|[;&|]\s*)"
+            r"((?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*)|(?:sudo\s+|command\s+|nohup\s+)*)"
+            r"((?:\S*/)?hermes\s+kanban\b|(?:\S*/)?python3?\s+-m\s+hermes_cli\.(?:kanban\b|main\s+kanban\b))"
+        )
+        return bool(pattern.search(command))
+    return any(_tokens_run_hermes_kanban(segment) for segment in _split_shell_segments(tokens))
+
 
 def _looks_like_env_assignment(token: str) -> bool:
     """Return True when *token* is a leading shell environment assignment."""
@@ -1892,6 +2011,14 @@ def terminal_tool(
                 "exit_code": -1,
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
+            }, ensure_ascii=False)
+
+        if _rsi_local_kanban_disabled() and _command_invokes_local_hermes_kanban(command):
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": _RSI_LOCAL_KANBAN_DISABLED_MESSAGE,
+                "status": "blocked",
             }, ensure_ascii=False)
 
         # Get configuration

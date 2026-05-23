@@ -102,6 +102,10 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
+_RSI_LOCAL_KANBAN_DISABLED_MESSAGE = (
+    "Hermes local Kanban is disabled in RSI. Use RSI native Kanban tools "
+    "(`rsi_kanban.*`) backed by platform Postgres instead."
+)
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -156,6 +160,20 @@ DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
 # stops the duplication; once no duplicate is spawned the pressure eases, the
 # signal lands, and the following tick reclaims cleanly.
 RECLAIM_DEFER_GRACE_SECONDS = 120
+
+
+def rsi_local_kanban_disabled() -> bool:
+    return os.environ.get("RSI_DISABLE_HERMES_LOCAL_KANBAN", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _ensure_local_kanban_enabled() -> None:
+    if rsi_local_kanban_disabled():
+        raise RuntimeError(_RSI_LOCAL_KANBAN_DISABLED_MESSAGE)
 
 
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
@@ -1597,6 +1615,8 @@ def connect(
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
     """
+    _ensure_local_kanban_enabled()
+
     if db_path is not None:
         path = db_path
     else:
@@ -1730,6 +1750,8 @@ def init_db(
     external tools that upgrade an old DB file — can call this to
     force re-migration.
     """
+    _ensure_local_kanban_enabled()
+
     if db_path is not None:
         path = db_path
     else:

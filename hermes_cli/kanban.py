@@ -29,6 +29,26 @@ from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name
 
 
+_RSI_LOCAL_KANBAN_DISABLED_MESSAGE = (
+    "Hermes local Kanban is disabled in RSI. Use RSI native Kanban tools "
+    "(`rsi_kanban.*`) backed by platform Postgres instead."
+)
+
+
+def rsi_local_kanban_disabled() -> bool:
+    return os.environ.get("RSI_DISABLE_HERMES_LOCAL_KANBAN", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _deny_rsi_local_kanban() -> int:
+    print(_RSI_LOCAL_KANBAN_DISABLED_MESSAGE, file=sys.stderr)
+    return 2
+
+
 # ---------------------------------------------------------------------------
 # Small formatting helpers
 # ---------------------------------------------------------------------------
@@ -857,6 +877,9 @@ def kanban_command(args: argparse.Namespace) -> int:
 
     Returns a shell-style exit code (0 on success, non-zero on error).
     """
+    if rsi_local_kanban_disabled():
+        return _deny_rsi_local_kanban()
+
     action = getattr(args, "kanban_action", None)
     if not action:
         # No subaction given: print help via the stored parser reference.
@@ -2743,6 +2766,9 @@ def run_slash(rest: str) -> str:
     both the interactive CLI (``self._handle_kanban_command``) and the
     gateway (``_handle_kanban_command``) so formatting is identical.
     """
+    if rsi_local_kanban_disabled():
+        return _RSI_LOCAL_KANBAN_DISABLED_MESSAGE
+
     import io
     import contextlib
 
