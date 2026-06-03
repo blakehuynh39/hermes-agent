@@ -584,6 +584,69 @@ def run_conversation(
     external_tool_pending_payload = None
     required_final_tool_attempts = 0
 
+    def _required_final_tool_missing_result() -> Dict[str, Any]:
+        agent._drop_required_final_tool_scaffolding(messages)
+        agent._persist_session(messages, conversation_history)
+        return {
+            "final_response": None,
+            "messages": messages,
+            "api_calls": api_call_count,
+            "completed": False,
+            "partial": True,
+            "failed": True,
+            "error": (
+                "Model produced a final response without calling a "
+                "required final delivery tool."
+            ),
+            "termination_reason": "required_final_tool_missing",
+            "completion_verdict": "failed",
+            "required_final_tool_names": list(agent.required_final_tool_names),
+        }
+
+    def _append_required_final_tool_repair(
+        draft_response: str,
+        assistant_message: Any,
+        finish_reason: str,
+    ) -> bool:
+        nonlocal required_final_tool_attempts
+        if (
+            not getattr(agent, "required_final_tool_names", None)
+            or agent._has_required_final_tool_delivery(messages)
+        ):
+            return False
+        if required_final_tool_attempts >= agent.required_final_tool_max_attempts:
+            return False
+
+        required_final_tool_attempts += 1
+        draft_msg = agent._build_assistant_message(assistant_message, finish_reason)
+        draft_text = agent._strip_think_blocks(str(draft_response or "")).strip()
+        if draft_text:
+            draft_msg["content"] = draft_text
+        draft_msg["_required_final_tool_synthetic"] = True
+        messages.append(draft_msg)
+        messages.append({
+            "role": "user",
+            "content": agent._required_final_tool_repair_message(
+                draft_text,
+                required_final_tool_attempts,
+            ),
+            "_required_final_tool_synthetic": True,
+        })
+        logger.info(
+            "Final response missing required final tool delivery; "
+            "nudging model to call required tool (%d/%d)",
+            required_final_tool_attempts,
+            agent.required_final_tool_max_attempts,
+        )
+        agent._emit_status(
+            "Final response requires tool delivery; requesting "
+            f"required tool call ({required_final_tool_attempts}/"
+            f"{agent.required_final_tool_max_attempts})"
+        )
+        agent._session_messages = messages
+        agent._save_session_log(messages)
+        return True
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
@@ -4236,17 +4299,30 @@ def run_conversation(
                     # post-tool nudge below handle that instead of exiting early.
                     fallback = getattr(agent, '_last_content_with_tools', None)
                     if fallback and getattr(agent, '_last_content_tools_all_housekeeping', False):
-                        _turn_exit_reason = "fallback_prior_turn_content"
-                        logger.info("Empty follow-up after tool calls — using prior turn content as final response")
-                        agent._emit_status("↻ Empty response after tool calls — using earlier content as final answer")
+                        fallback_response = agent._strip_think_blocks(fallback).strip()
                         agent._last_content_with_tools = None
                         agent._last_content_tools_all_housekeeping = False
                         agent._empty_content_retries = 0
+                        if (
+                            getattr(agent, "required_final_tool_names", None)
+                            and not agent._has_required_final_tool_delivery(messages)
+                        ):
+                            if _append_required_final_tool_repair(
+                                fallback_response,
+                                assistant_message,
+                                finish_reason,
+                            ):
+                                continue
+                            _turn_exit_reason = "required_final_tool_missing"
+                            return _required_final_tool_missing_result()
+                        _turn_exit_reason = "fallback_prior_turn_content"
+                        logger.info("Empty follow-up after tool calls — using prior turn content as final response")
+                        agent._emit_status("↻ Empty response after tool calls — using earlier content as final answer")
                         # Do NOT modify the assistant message content — the
                         # old code injected "Calling the X tools..." which
                         # poisoned the conversation history.  Just use the
                         # fallback text as the final response and break.
-                        final_response = agent._strip_think_blocks(fallback).strip()
+                        final_response = fallback_response
                         agent._response_was_previewed = True
                         break
 
@@ -4505,52 +4581,15 @@ def run_conversation(
                     getattr(agent, "required_final_tool_names", None)
                     and not agent._has_required_final_tool_delivery(messages)
                 ):
-                    if required_final_tool_attempts < agent.required_final_tool_max_attempts:
-                        required_final_tool_attempts += 1
-                        draft_msg = agent._build_assistant_message(assistant_message, finish_reason)
-                        draft_msg["_required_final_tool_synthetic"] = True
-                        messages.append(draft_msg)
-                        messages.append({
-                            "role": "user",
-                            "content": agent._required_final_tool_repair_message(
-                                final_response,
-                                required_final_tool_attempts,
-                            ),
-                            "_required_final_tool_synthetic": True,
-                        })
-                        logger.info(
-                            "Final response missing required final tool delivery; "
-                            "nudging model to call required tool (%d/%d)",
-                            required_final_tool_attempts,
-                            agent.required_final_tool_max_attempts,
-                        )
-                        agent._emit_status(
-                            "Final response requires tool delivery; requesting "
-                            f"required tool call ({required_final_tool_attempts}/"
-                            f"{agent.required_final_tool_max_attempts})"
-                        )
-                        agent._session_messages = messages
-                        agent._save_session_log(messages)
+                    if _append_required_final_tool_repair(
+                        final_response,
+                        assistant_message,
+                        finish_reason,
+                    ):
                         continue
 
                     _turn_exit_reason = "required_final_tool_missing"
-                    agent._drop_required_final_tool_scaffolding(messages)
-                    agent._persist_session(messages, conversation_history)
-                    return {
-                        "final_response": None,
-                        "messages": messages,
-                        "api_calls": api_call_count,
-                        "completed": False,
-                        "partial": True,
-                        "failed": True,
-                        "error": (
-                            "Model produced a final response without calling a "
-                            "required final delivery tool."
-                        ),
-                        "termination_reason": "required_final_tool_missing",
-                        "completion_verdict": "failed",
-                        "required_final_tool_names": list(agent.required_final_tool_names),
-                    }
+                    return _required_final_tool_missing_result()
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
@@ -4640,6 +4679,17 @@ def run_conversation(
                 # session resume (avoids consecutive user messages).
                 messages.append({"role": "assistant", "content": final_response})
                 break
+
+    if (
+        final_response is not None
+        and not failed
+        and not interrupted
+        and not external_tool_pending_payload
+        and getattr(agent, "required_final_tool_names", None)
+        and not agent._has_required_final_tool_delivery(messages)
+    ):
+        _turn_exit_reason = "required_final_tool_missing"
+        return _required_final_tool_missing_result()
     
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled

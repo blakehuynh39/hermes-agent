@@ -3715,6 +3715,88 @@ class TestRunConversation:
             for msg in result["messages"]
         )
 
+    def test_required_final_tool_nudges_before_prior_content_fallback(self, agent):
+        self._setup_agent(agent)
+        agent.tools = _make_tool_defs("todo", "rsi_slack_message_post")
+        agent.valid_tool_names = {"todo", "rsi_slack_message_post"}
+        agent.required_final_tool_names = ["rsi_slack_message_post"]
+        agent._required_final_tool_name_set = {"rsi_slack_message_post"}
+        agent.required_final_tool_max_attempts = 2
+        agent.required_final_tool_instruction = "Use message_post for simple prose."
+
+        todo_call = _mock_tool_call(
+            name="todo",
+            arguments='{"todos":[{"id":"1","content":"deliver","status":"completed"}]}',
+            call_id="todo-1",
+        )
+        delivery_call = _mock_tool_call(
+            name="rsi_slack_message_post",
+            arguments='{"channel_id":"C123","text":"Draft answer"}',
+            call_id="delivery-1",
+        )
+        resp1 = _mock_response(
+            content="Draft answer",
+            finish_reason="tool_calls",
+            tool_calls=[todo_call],
+        )
+        # This empty follow-up used to accept resp1.content as final because
+        # todo is housekeeping. With required final delivery, Hermes must
+        # nudge the model to call the Slack delivery tool instead.
+        resp2 = _mock_response(content="", finish_reason="stop")
+        resp3 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[delivery_call])
+        resp4 = _mock_response(content="Delivered.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3, resp4]
+
+        delivery_result = json.dumps(
+            {
+                "status": "ok",
+                "reply_delivery": {
+                    "tool_name": "rsi_slack.message_post",
+                    "send_status": "posted",
+                    "provider_ref": "slack:C123:123.456",
+                },
+            }
+        )
+
+        def _handle_function_call(name, *args, **kwargs):
+            if name == "rsi_slack_message_post":
+                return delivery_result
+            return json.dumps({"todos": []})
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=_handle_function_call) as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer in Slack")
+
+        assert result["final_response"] == "Delivered."
+        assert result["completed"] is True
+        assert result["required_final_tool_delivered"] is True
+        assert [call.args[0] for call in mock_handle_function_call.call_args_list] == [
+            "rsi_slack_message_post",
+        ]
+
+        third_call_messages = agent.client.chat.completions.create.call_args_list[2].kwargs["messages"]
+        assert third_call_messages[-1]["role"] == "user"
+        assert "requires final delivery through a tool call" in third_call_messages[-1]["content"]
+        assert "Draft answer" in third_call_messages[-1]["content"]
+
+        assert not any(
+            msg.get("_required_final_tool_synthetic")
+            for msg in result["messages"]
+            if isinstance(msg, dict)
+        )
+        assert any(
+            msg.get("role") == "tool" and msg.get("tool_call_id") == "todo-1"
+            for msg in result["messages"]
+        )
+        assert any(
+            msg.get("role") == "tool" and msg.get("tool_call_id") == "delivery-1"
+            for msg in result["messages"]
+        )
+
     def test_required_final_tool_fails_closed_after_bounded_attempts(self, agent):
         self._setup_agent(agent)
         agent.required_final_tool_names = ["rsi_slack_message_post"]
