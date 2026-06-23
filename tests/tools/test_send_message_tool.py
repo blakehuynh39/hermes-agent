@@ -31,7 +31,6 @@ from tools.send_message_tool import (
     _parse_target_ref,
     _send_matrix_via_adapter,
     _send_signal,
-    _send_slack,
     _send_telegram,
     _send_to_platform,
     send_message_tool,

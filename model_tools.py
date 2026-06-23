@@ -1143,7 +1143,6 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
-                        session_id=session_id,
                         tool_call_id=tool_call_id,
                     )
             else:
@@ -1153,7 +1152,6 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
-                        session_id=session_id,
                         tool_call_id=tool_call_id,
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
