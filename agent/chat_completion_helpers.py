@@ -704,6 +704,8 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         _prefs["require_parameters"] = True
     if agent.provider_data_collection:
         _prefs["data_collection"] = agent.provider_data_collection
+    if getattr(agent, "provider_quantizations", None):
+        _prefs["quantizations"] = agent.provider_quantizations
 
     # Claude max-output override on aggregators
     _ant_max = None
@@ -1460,6 +1462,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 provider_preferences["order"] = agent.providers_order
             if agent.provider_sort:
                 provider_preferences["sort"] = agent.provider_sort
+            if getattr(agent, "provider_quantizations", None):
+                provider_preferences["quantizations"] = agent.provider_quantizations
             if provider_preferences and (
                 (agent.provider or "").strip().lower() == "openrouter"
                 or agent._is_openrouter_url()

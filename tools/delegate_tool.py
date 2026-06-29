@@ -1206,12 +1206,14 @@ def _build_child_agent(
     child_providers_ignored = getattr(parent_agent, "providers_ignored", None)
     child_providers_order = getattr(parent_agent, "providers_order", None)
     child_provider_sort = getattr(parent_agent, "provider_sort", None)
+    child_provider_quantizations = getattr(parent_agent, "provider_quantizations", None)
     child_openrouter_min_coding_score = getattr(parent_agent, "openrouter_min_coding_score", None)
     if override_provider:
         child_providers_allowed = None
         child_providers_ignored = None
         child_providers_order = None
         child_provider_sort = None
+        child_provider_quantizations = None
         # Note: openrouter_min_coding_score is model-gated (only emitted on
         # openrouter/pareto-code), so we keep it inherited even when the
         # provider is overridden — it's a no-op on any other model.
@@ -1244,6 +1246,7 @@ def _build_child_agent(
         providers_ignored=child_providers_ignored,
         providers_order=child_providers_order,
         provider_sort=child_provider_sort,
+        provider_quantizations=child_provider_quantizations,
         openrouter_min_coding_score=child_openrouter_min_coding_score,
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent

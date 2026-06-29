@@ -1120,6 +1120,12 @@ class TestProviderRouting:
         kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
         assert kwargs["extra_body"]["provider"]["data_collection"] == "deny"
 
+    def test_quantizations(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.provider_quantizations = ["fp16", "bf16", "fp32"]
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert kwargs["extra_body"]["provider"]["quantizations"] == ["fp16", "bf16", "fp32"]
+
     def test_no_routing_when_unset(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openrouter")
         kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
